@@ -3,7 +3,8 @@
 
     <application
         android:allowBackup="true"
-        android:label="OpenCanvas"
+        android:icon="@mipmap/ic_launcher"
+        android:label="Carnival"
         android:theme="@android:style/Theme.Material.Light.NoActionBar">
 
         <activity

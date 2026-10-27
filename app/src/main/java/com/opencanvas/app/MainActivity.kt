@@ -175,7 +175,7 @@ class MainActivity : Activity() {
 
     private fun savePng() {
         val bmp = canvas.exportBitmap()
-        val name = "OpenCanvas_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        val name = "Carnival_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
         val appCtx = applicationContext
         Thread {
             val where = Exporter.savePng(appCtx, bmp, name)

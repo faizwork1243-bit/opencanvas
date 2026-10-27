@@ -12,5 +12,5 @@ dependencyResolutionManagement {
         mavenCentral()
     }
 }
-rootProject.name = "OpenCanvas"
+rootProject.name = "Carnival"
 include(":app")

@@ -19,7 +19,7 @@ object Exporter {
                 values.put(MediaStore.Images.Media.MIME_TYPE, "image/png")
                 values.put(
                     MediaStore.Images.Media.RELATIVE_PATH,
-                    Environment.DIRECTORY_PICTURES + "/OpenCanvas"
+                    Environment.DIRECTORY_PICTURES + "/Carnival"
                 )
                 val uri = context.contentResolver.insert(
                     MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values
@@ -27,7 +27,7 @@ object Exporter {
                 context.contentResolver.openOutputStream(uri)?.use { out ->
                     bmp.compress(Bitmap.CompressFormat.PNG, 100, out)
                 }
-                "Pictures/OpenCanvas/$name.png"
+                "Pictures/Carnival/$name.png"
             } else {
                 val dir = context.getExternalFilesDir(Environment.DIRECTORY_PICTURES) ?: return null
                 val f = File(dir, "$name.png")

@@ -1,6 +1,6 @@
-# OpenCanvas
+# Carnival
 
-An original, Procreate-style drawing app for Android. Built from scratch in Kotlin.
+An original, Procreate-style drawing app for Android, built from scratch in Kotlin. (Earlier working name: OpenCanvas.)
 
 ## Build (GitHub Actions)
 Push to `main` -> Actions tab -> latest run -> download the `opencanvas-debug-apk` artifact -> install on your device.
