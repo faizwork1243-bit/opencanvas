@@ -12,6 +12,7 @@ import android.graphics.drawable.GradientDrawable
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
+import android.widget.ScrollView
 import android.widget.TextView
 
 object Ui {
@@ -185,5 +186,13 @@ class LayerThumb(context: Context, private val layer: Layer) : View(context) {
         dst.set(0f, 0f, width.toFloat(), height.toFloat())
         canvas.drawRect(dst, paper)
         canvas.drawBitmap(layer.bitmap, src, dst, bmp)
+    }
+}
+
+/** A ScrollView that grows with its content up to a maximum height. */
+class MaxHeightScrollView(context: Context, private val maxPx: Int) : ScrollView(context) {
+    override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+        val limited = View.MeasureSpec.makeMeasureSpec(maxPx, View.MeasureSpec.AT_MOST)
+        super.onMeasure(widthMeasureSpec, limited)
     }
 }

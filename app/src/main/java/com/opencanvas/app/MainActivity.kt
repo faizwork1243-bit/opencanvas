@@ -1,6 +1,7 @@
 package com.opencanvas.app
 
 import android.app.Activity
+import android.app.AlertDialog
 import android.graphics.Color
 import android.os.Bundle
 import android.view.Gravity
@@ -51,6 +52,13 @@ class MainActivity : Activity() {
 
         canvas = CanvasView(this)
         canvas.onBlocked = { msg -> toast(msg) }
+        canvas.onColorPicked = { c ->
+            canvas.brushColor = c
+            canvas.eraser = false
+            picker.setColor(c)
+            addRecent(c)
+            updateToolButtons()
+        }
 
         recent.addAll(
             listOf(
@@ -138,15 +146,31 @@ class MainActivity : Activity() {
         pm.menu.add("Save PNG")
         pm.menu.add("Clear layer")
         pm.menu.add("Fit to screen")
+        pm.menu.add("Gesture guide")
         pm.setOnMenuItemClickListener { item ->
             when (item.title.toString()) {
                 "Save PNG" -> savePng()
                 "Clear layer" -> canvas.doc.clearActive()
                 "Fit to screen" -> canvas.fitToView()
+                "Gesture guide" -> showGuide()
             }
             true
         }
         pm.show()
+    }
+
+    private fun showGuide() {
+        val text = "Draw: one finger or stylus\n" +
+            "Pan and zoom: two fingers\n" +
+            "Undo: tap once with two fingers\n" +
+            "Redo: tap once with three fingers\n" +
+            "Straight line: draw, then hold still before lifting\n" +
+            "Eyedropper: touch and hold without moving"
+        AlertDialog.Builder(this)
+            .setTitle("Gestures")
+            .setMessage(text)
+            .setPositiveButton("OK", null)
+            .show()
     }
 
     private fun savePng() {
@@ -253,9 +277,11 @@ class MainActivity : Activity() {
 
         layerList = LinearLayout(this)
         layerList.orientation = LinearLayout.VERTICAL
-        val scroll = ScrollView(this)
+        val scroll = MaxHeightScrollView(this, dp(260))
         scroll.addView(layerList)
-        val sp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(230))
+        val sp = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        )
         sp.setMargins(0, dp(8), 0, dp(8))
         layerPanel.addView(scroll, sp)
 

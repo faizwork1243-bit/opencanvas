@@ -23,6 +23,13 @@ class Stroke(val color: Int, val size: Float, val opacity: Float, val erase: Boo
         pts.add(pt)
     }
 
+    /** Used by hold-to-straighten: collapse the stroke into a single straight segment. */
+    fun replaceWithLine(a: Pt, b: Pt) {
+        pts.clear()
+        add(a)
+        add(b)
+    }
+
     fun inflatedBounds(): RectF {
         val r = RectF(bounds)
         val m = size / 2f + 2f

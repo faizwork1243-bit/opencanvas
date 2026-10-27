@@ -9,21 +9,32 @@ import android.graphics.Paint
 import android.graphics.PorterDuff
 import android.graphics.Rect
 import android.graphics.RectF
+import android.os.Handler
+import android.os.Looper
 import android.util.AttributeSet
 import android.view.MotionEvent
 import android.view.ScaleGestureDetector
 import android.view.View
+import android.view.ViewConfiguration
 import kotlin.math.abs
+import kotlin.math.hypot
+import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
 
 /**
  * The drawing surface.
  *
- * - One finger / stylus draws, two fingers pan + pinch-zoom.
- * - The live stroke is drawn into a scratch bitmap and composited at the brush opacity,
- *   so overlapping parts of one stroke never double-darken.
- * - When a stroke ends it is baked into the active layer and recorded for undo.
+ * Gestures:
+ * - one finger / stylus draws
+ * - two fingers pan + pinch-zoom
+ * - quick tap with two fingers = undo, with three fingers = redo
+ * - draw, then hold still before lifting = the stroke snaps to a straight line
+ * - touch and hold without moving = eyedropper
+ *
+ * The live stroke is drawn into a scratch bitmap and composited at the brush opacity,
+ * so overlapping parts of one stroke never double-darken. When a stroke ends it is baked
+ * into the active layer and recorded for undo.
  */
 class CanvasView @JvmOverloads constructor(
     context: Context,
@@ -42,6 +53,11 @@ class CanvasView @JvmOverloads constructor(
 
     var onDocChanged: (() -> Unit)? = null
     var onBlocked: ((String) -> Unit)? = null
+    var onColorPicked: ((Int) -> Unit)? = null
+
+    private val density = context.resources.displayMetrics.density
+    private val slop = ViewConfiguration.get(context).scaledTouchSlop.toFloat()
+    private val holdSlop = 6f * density
 
     private val scratch = Bitmap.createBitmap(Document.SIZE, Document.SIZE, Bitmap.Config.ARGB_8888)
     private val scratchCanvas = Canvas(scratch)
@@ -60,10 +76,36 @@ class CanvasView @JvmOverloads constructor(
     private val bitmapPaint = Paint(Paint.FILTER_BITMAP_FLAG)
     private val livePaint = Paint(Paint.FILTER_BITMAP_FLAG)
     private val ringPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
+    private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+
+    // gesture state
+    private val handler = Handler(Looper.getMainLooper())
+    private val holdRunnable = Runnable { snapToLine() }
+    private val pickRunnable = Runnable { startPicking() }
 
     private var gesturing = false
     private var lastFx = 0f
     private var lastFy = 0f
+
+    private val startX = FloatArray(MAX_POINTERS)
+    private val startY = FloatArray(MAX_POINTERS)
+    private var maxPointers = 1
+    private var gestureDown = 0L
+    private var tapCandidate = false
+
+    private var downX = 0f
+    private var downY = 0f
+    private var lastX = 0f
+    private var lastY = 0f
+    private var anchorX = 0f
+    private var anchorY = 0f
+    private var moved = false
+    private var straight = false
+
+    private var picking = false
+    private var pickX = 0f
+    private var pickY = 0f
+    private var pickColor = Color.BLACK
 
     private val scaleDetector = ScaleGestureDetector(
         context,
@@ -114,6 +156,12 @@ class CanvasView @JvmOverloads constructor(
         fitToView()
     }
 
+    override fun onDetachedFromWindow() {
+        handler.removeCallbacks(holdRunnable)
+        handler.removeCallbacks(pickRunnable)
+        super.onDetachedFromWindow()
+    }
+
     private fun currentScale(): Float {
         matrix.getValues(vals)
         return vals[Matrix.MSCALE_X]
@@ -150,15 +198,46 @@ class CanvasView @JvmOverloads constructor(
 
         if (previewSize > 0f) {
             val r = previewSize * currentScale() / 2f
-            val cx = width / 2f
-            val cy = height / 2f
-            val d = resources.displayMetrics.density
-            ringPaint.strokeWidth = 3f * d
-            ringPaint.color = Color.BLACK
-            canvas.drawCircle(cx, cy, r, ringPaint)
-            ringPaint.strokeWidth = 1.5f * d
-            ringPaint.color = Color.WHITE
-            canvas.drawCircle(cx, cy, r, ringPaint)
+            drawRing(canvas, width / 2f, height / 2f, r)
+        }
+
+        if (picking) {
+            val r = 30f * density
+            val off = 76f * density
+            val cy = if (pickY - off < r) pickY + off else pickY - off
+            fillPaint.color = pickColor
+            canvas.drawCircle(pickX, cy, r, fillPaint)
+            drawRing(canvas, pickX, cy, r)
+            drawRing(canvas, pickX, pickY, 7f * density)
+        }
+    }
+
+    private fun drawRing(canvas: Canvas, cx: Float, cy: Float, r: Float) {
+        ringPaint.strokeWidth = 3f * density
+        ringPaint.color = Color.BLACK
+        canvas.drawCircle(cx, cy, r, ringPaint)
+        ringPaint.strokeWidth = 1.5f * density
+        ringPaint.color = Color.WHITE
+        canvas.drawCircle(cx, cy, r, ringPaint)
+    }
+
+    // ---- touch -----------------------------------------------------------------
+
+    private fun recordStart(e: MotionEvent, index: Int) {
+        val id = e.getPointerId(index)
+        if (id in 0 until MAX_POINTERS) {
+            startX[id] = e.getX(index)
+            startY[id] = e.getY(index)
+        }
+    }
+
+    private fun checkTapMovement(e: MotionEvent) {
+        for (i in 0 until e.pointerCount) {
+            val id = e.getPointerId(i)
+            if (id !in 0 until MAX_POINTERS) continue
+            if (hypot(e.getX(i) - startX[id], e.getY(i) - startY[id]) > slop * 2f) {
+                tapCandidate = false
+            }
         }
     }
 
@@ -167,18 +246,43 @@ class CanvasView @JvmOverloads constructor(
         when (e.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 gesturing = false
+                maxPointers = 1
+                tapCandidate = true
+                gestureDown = e.eventTime
+                recordStart(e, 0)
+                downX = e.x
+                downY = e.y
+                lastX = e.x
+                lastY = e.y
+                anchorX = e.x
+                anchorY = e.y
+                moved = false
+                straight = false
+                picking = false
+                handler.removeCallbacks(holdRunnable)
+                handler.removeCallbacks(pickRunnable)
+                handler.postDelayed(pickRunnable, PICK_DELAY_MS)
                 beginStroke(e)
             }
             MotionEvent.ACTION_POINTER_DOWN -> {
+                handler.removeCallbacks(pickRunnable)
+                handler.removeCallbacks(holdRunnable)
+                picking = false
+                maxPointers = max(maxPointers, e.pointerCount)
+                recordStart(e, e.actionIndex)
                 if (!gesturing) {
                     cancelStroke()
                     gesturing = true
                 }
                 lastFx = focusX(e, -1)
                 lastFy = focusY(e, -1)
+                invalidate()
             }
             MotionEvent.ACTION_MOVE -> {
+                lastX = e.x
+                lastY = e.y
                 if (gesturing) {
+                    checkTapMovement(e)
                     if (e.pointerCount >= 2) {
                         val fx = focusX(e, -1)
                         val fy = focusY(e, -1)
@@ -187,8 +291,28 @@ class CanvasView @JvmOverloads constructor(
                         lastFy = fy
                         invalidate()
                     }
+                } else if (picking) {
+                    updatePick(e.x, e.y)
                 } else {
-                    extendStroke(e)
+                    if (!moved && hypot(e.x - downX, e.y - downY) > slop) {
+                        moved = true
+                        handler.removeCallbacks(pickRunnable)
+                    }
+                    if (straight) {
+                        val s = current
+                        if (s != null) {
+                            val d = toDoc(e.x, e.y)
+                            rebuildLine(s, d[0], d[1])
+                        }
+                    } else {
+                        extendStroke(e)
+                        if (moved && hypot(e.x - anchorX, e.y - anchorY) > holdSlop) {
+                            anchorX = e.x
+                            anchorY = e.y
+                            handler.removeCallbacks(holdRunnable)
+                            handler.postDelayed(holdRunnable, HOLD_DELAY_MS)
+                        }
+                    }
                 }
             }
             MotionEvent.ACTION_POINTER_UP -> {
@@ -198,7 +322,22 @@ class CanvasView @JvmOverloads constructor(
                 }
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                if (!gesturing) finishStroke(e)
+                handler.removeCallbacks(pickRunnable)
+                handler.removeCallbacks(holdRunnable)
+                if (picking) {
+                    endPicking()
+                } else if (!gesturing) {
+                    finishStroke(e)
+                } else if (e.actionMasked == MotionEvent.ACTION_UP &&
+                    tapCandidate &&
+                    e.eventTime - gestureDown < TAP_MS
+                ) {
+                    if (maxPointers == 2) {
+                        doc.undo()
+                    } else if (maxPointers == 3) {
+                        doc.redo()
+                    }
+                }
                 gesturing = false
             }
         }
@@ -225,6 +364,42 @@ class CanvasView @JvmOverloads constructor(
             n++
         }
         return if (n == 0) 0f else sum / n
+    }
+
+    // ---- eyedropper ----------------------------------------------------------------
+
+    private fun startPicking() {
+        if (gesturing) return
+        cancelStroke()
+        picking = true
+        updatePick(lastX, lastY)
+    }
+
+    private fun updatePick(x: Float, y: Float) {
+        pickX = x
+        pickY = y
+        val d = toDoc(x, y)
+        val ix = d[0].toInt().coerceIn(0, Document.SIZE - 1)
+        val iy = d[1].toInt().coerceIn(0, Document.SIZE - 1)
+        pickColor = sampleColor(ix, iy)
+        invalidate()
+    }
+
+    private fun endPicking() {
+        picking = false
+        invalidate()
+        onColorPicked?.invoke(pickColor)
+    }
+
+    /** Renders just one pixel of the flattened document. */
+    private fun sampleColor(x: Int, y: Int): Int {
+        val b = Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888)
+        val c = Canvas(b)
+        c.translate(-x.toFloat(), -y.toFloat())
+        drawDocument(c, false)
+        val px = b.getPixel(0, 0)
+        b.recycle()
+        return px
     }
 
     // ---- stroke handling ---------------------------------------------------
@@ -297,21 +472,46 @@ class CanvasView @JvmOverloads constructor(
         scratchCanvas.restore()
     }
 
+    /** Hold-to-straighten: replace the drawn curve with a line from its start to the finger. */
+    private fun snapToLine() {
+        val s = current ?: return
+        if (straight || gesturing || picking || s.pts.size < 3) return
+        straight = true
+        val d = toDoc(lastX, lastY)
+        rebuildLine(s, d[0], d[1])
+    }
+
+    private fun rebuildLine(s: Stroke, x: Float, y: Float) {
+        val old = Rect()
+        s.inflatedBounds().roundOut(old)
+        if (old.intersect(0, 0, Document.SIZE, Document.SIZE)) clearScratch(old)
+        val first = s.pts[0]
+        s.replaceWithLine(first, Pt(x, y, first.p))
+        StrokeRenderer.drawDot(scratchCanvas, s, s.pts[0])
+        StrokeRenderer.drawSegment(scratchCanvas, s, s.pts[0], s.pts[1])
+        invalidate()
+    }
+
     private fun finishStroke(e: MotionEvent) {
         val s = current ?: return
         val layer = liveLayer ?: return
 
-        // Snap the end of the stroke to where the finger actually lifted.
         val d = toDoc(e.x, e.y)
-        val last = s.pts[s.pts.size - 1]
-        if (abs(d[0] - last.x) + abs(d[1] - last.y) > 0.5f) {
-            appendPoint(s, d[0], d[1], last.p)
+        if (straight) {
+            rebuildLine(s, d[0], d[1])
+        } else {
+            // Snap the end of the stroke to where the finger actually lifted.
+            val last = s.pts[s.pts.size - 1]
+            if (abs(d[0] - last.x) + abs(d[1] - last.y) > 0.5f) {
+                appendPoint(s, d[0], d[1], last.p)
+            }
         }
 
         val r = Rect()
         s.inflatedBounds().roundOut(r)
         current = null
         liveLayer = null
+        straight = false
         if (!r.intersect(0, 0, Document.SIZE, Document.SIZE)) {
             invalidate()
             return
@@ -330,6 +530,7 @@ class CanvasView @JvmOverloads constructor(
         if (r.intersect(0, 0, Document.SIZE, Document.SIZE)) clearScratch(r)
         current = null
         liveLayer = null
+        straight = false
         invalidate()
     }
 
@@ -337,5 +538,9 @@ class CanvasView @JvmOverloads constructor(
         private const val SMOOTHING = 0.55f
         private const val MIN_SCALE = 0.05f
         private const val MAX_SCALE = 32f
+        private const val MAX_POINTERS = 16
+        private const val PICK_DELAY_MS = 550L
+        private const val HOLD_DELAY_MS = 500L
+        private const val TAP_MS = 350L
     }
 }
