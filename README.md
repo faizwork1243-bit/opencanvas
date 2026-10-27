@@ -8,7 +8,7 @@ Push to `main` -> Actions tab -> latest run -> download the `opencanvas-debug-ap
 ## Roadmap
 - [x] Phase 1: canvas, pressure, smoothing, pan/zoom, undo/redo, eraser, colors, size
 - [x] Phase 2: layers (opacity, visibility, lock, blend modes, reorder, copy), Procreate-style layout, color picker, Save PNG
-- [x] Phase 3: gestures (two-finger tap undo, three-finger tap redo, hold-to-straighten, long-press eyedropper)
+- [x] Phase 3: gestures (two-finger tap undo, three-finger tap redo, QuickShape hold-to-snap for lines, arcs, circles, ellipses, rectangles, triangles; long-press eyedropper)
 - [ ] Phase 4: GPU engine (OpenGL ES), tiled undo, low-latency stylus path
 - [ ] Phase 5: brush engine and Brush Studio (stamps, spacing, jitter, textures, smudge)
 - [ ] Phase 6: selection and transform, QuickShape

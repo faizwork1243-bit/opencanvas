@@ -12,6 +12,7 @@ import android.graphics.RectF
 import android.os.Handler
 import android.os.Looper
 import android.util.AttributeSet
+import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.ScaleGestureDetector
 import android.view.View
@@ -80,7 +81,7 @@ class CanvasView @JvmOverloads constructor(
 
     // gesture state
     private val handler = Handler(Looper.getMainLooper())
-    private val holdRunnable = Runnable { snapToLine() }
+    private val holdRunnable = Runnable { snapToShape() }
     private val pickRunnable = Runnable { startPicking() }
 
     private var gesturing = false
@@ -101,6 +102,7 @@ class CanvasView @JvmOverloads constructor(
     private var anchorY = 0f
     private var moved = false
     private var straight = false
+    private var shapeFollows = false
 
     private var picking = false
     private var pickX = 0f
@@ -235,9 +237,38 @@ class CanvasView @JvmOverloads constructor(
         for (i in 0 until e.pointerCount) {
             val id = e.getPointerId(i)
             if (id !in 0 until MAX_POINTERS) continue
-            if (hypot(e.getX(i) - startX[id], e.getY(i) - startY[id]) > slop * 2f) {
+            val tol = slop * (if (maxPointers >= 3) 3f else 2f)
+            if (hypot(e.getX(i) - startX[id], e.getY(i) - startY[id]) > tol) {
                 tapCandidate = false
             }
+        }
+    }
+
+    /** Two-finger tap = undo, three-finger tap = redo. */
+    private fun finishMultiTouch(e: MotionEvent) {
+        val isUp = e.actionMasked == MotionEvent.ACTION_UP
+        val limit = if (maxPointers >= 3) TAP3_MS else TAP_MS
+        val quick = e.eventTime - gestureDown < limit
+        // Some phones cancel three-finger touches for their own system gestures,
+        // so a quick cancelled three-finger touch still counts as a tap.
+        val tapped = tapCandidate && quick && (isUp || maxPointers >= 3)
+        if (tapped) {
+            if (maxPointers == 2) {
+                doc.undo()
+            } else if (maxPointers == 3) {
+                doc.redo()
+            }
+            return
+        }
+        if (maxPointers >= 3) {
+            val why = if (!tapCandidate) {
+                "fingers moved too much"
+            } else if (!quick) {
+                "too slow"
+            } else {
+                "cancelled by the system"
+            }
+            onBlocked?.invoke("Three-finger tap not recognised: $why")
         }
     }
 
@@ -258,6 +289,7 @@ class CanvasView @JvmOverloads constructor(
                 anchorY = e.y
                 moved = false
                 straight = false
+                shapeFollows = false
                 picking = false
                 handler.removeCallbacks(holdRunnable)
                 handler.removeCallbacks(pickRunnable)
@@ -300,7 +332,7 @@ class CanvasView @JvmOverloads constructor(
                     }
                     if (straight) {
                         val s = current
-                        if (s != null) {
+                        if (s != null && shapeFollows) {
                             val d = toDoc(e.x, e.y)
                             rebuildLine(s, d[0], d[1])
                         }
@@ -328,15 +360,8 @@ class CanvasView @JvmOverloads constructor(
                     endPicking()
                 } else if (!gesturing) {
                     finishStroke(e)
-                } else if (e.actionMasked == MotionEvent.ACTION_UP &&
-                    tapCandidate &&
-                    e.eventTime - gestureDown < TAP_MS
-                ) {
-                    if (maxPointers == 2) {
-                        doc.undo()
-                    } else if (maxPointers == 3) {
-                        doc.redo()
-                    }
+                } else {
+                    finishMultiTouch(e)
                 }
                 gesturing = false
             }
@@ -472,13 +497,44 @@ class CanvasView @JvmOverloads constructor(
         scratchCanvas.restore()
     }
 
-    /** Hold-to-straighten: replace the drawn curve with a line from its start to the finger. */
-    private fun snapToLine() {
+    /** QuickShape: after holding still, snap the stroke to a line, arc, circle, ellipse, rectangle or polygon. */
+    private fun snapToShape() {
         val s = current ?: return
         if (straight || gesturing || picking || s.pts.size < 3) return
-        straight = true
         val d = toDoc(lastX, lastY)
-        rebuildLine(s, d[0], d[1])
+        val n = s.pts.size
+        val xs = FloatArray(n + 1)
+        val ys = FloatArray(n + 1)
+        for (i in 0 until n) {
+            xs[i] = s.pts[i].x
+            ys[i] = s.pts[i].y
+        }
+        xs[n] = d[0]
+        ys[n] = d[1]
+        val res = ShapeFit.recognize(xs, ys)
+        straight = true
+        shapeFollows = res.kind == ShapeFit.LINE
+        performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+        if (shapeFollows) {
+            rebuildLine(s, d[0], d[1])
+        } else {
+            rebuildShape(s, res)
+        }
+    }
+
+    private fun rebuildShape(s: Stroke, res: ShapeResult) {
+        val old = Rect()
+        s.inflatedBounds().roundOut(old)
+        if (old.intersect(0, 0, Document.SIZE, Document.SIZE)) clearScratch(old)
+        var sum = 0f
+        for (pt in s.pts) sum += pt.p
+        val p = sum / s.pts.size
+        s.replaceWith(res.xs, res.ys, p)
+        StrokeRenderer.drawDot(scratchCanvas, s, s.pts[0])
+        for (i in 1 until s.pts.size) {
+            StrokeRenderer.drawSegment(scratchCanvas, s, s.pts[i - 1], s.pts[i])
+        }
+        invalidate()
     }
 
     private fun rebuildLine(s: Stroke, x: Float, y: Float) {
@@ -498,7 +554,7 @@ class CanvasView @JvmOverloads constructor(
 
         val d = toDoc(e.x, e.y)
         if (straight) {
-            rebuildLine(s, d[0], d[1])
+            if (shapeFollows) rebuildLine(s, d[0], d[1])
         } else {
             // Snap the end of the stroke to where the finger actually lifted.
             val last = s.pts[s.pts.size - 1]
@@ -512,6 +568,7 @@ class CanvasView @JvmOverloads constructor(
         current = null
         liveLayer = null
         straight = false
+        shapeFollows = false
         if (!r.intersect(0, 0, Document.SIZE, Document.SIZE)) {
             invalidate()
             return
@@ -531,6 +588,7 @@ class CanvasView @JvmOverloads constructor(
         current = null
         liveLayer = null
         straight = false
+        shapeFollows = false
         invalidate()
     }
 
@@ -542,5 +600,6 @@ class CanvasView @JvmOverloads constructor(
         private const val PICK_DELAY_MS = 550L
         private const val HOLD_DELAY_MS = 500L
         private const val TAP_MS = 350L
+        private const val TAP3_MS = 700L
     }
 }

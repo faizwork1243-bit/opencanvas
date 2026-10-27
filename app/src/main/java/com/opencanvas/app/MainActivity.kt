@@ -164,7 +164,7 @@ class MainActivity : Activity() {
             "Pan and zoom: two fingers\n" +
             "Undo: tap once with two fingers\n" +
             "Redo: tap once with three fingers\n" +
-            "Straight line: draw, then hold still before lifting\n" +
+            "Perfect shapes: draw a line, arc, circle, oval, rectangle or triangle, then hold still before lifting\n" +
             "Eyedropper: touch and hold without moving"
         AlertDialog.Builder(this)
             .setTitle("Gestures")

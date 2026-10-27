@@ -30,6 +30,12 @@ class Stroke(val color: Int, val size: Float, val opacity: Float, val erase: Boo
         add(b)
     }
 
+    /** Used by QuickShape: replace the stroke with a clean shape at constant pressure. */
+    fun replaceWith(xs: FloatArray, ys: FloatArray, p: Float) {
+        pts.clear()
+        for (i in xs.indices) add(Pt(xs[i], ys[i], p))
+    }
+
     fun inflatedBounds(): RectF {
         val r = RectF(bounds)
         val m = size / 2f + 2f
