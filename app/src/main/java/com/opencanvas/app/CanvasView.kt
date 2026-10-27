@@ -6,55 +6,60 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Matrix
 import android.graphics.Paint
+import android.graphics.PorterDuff
+import android.graphics.Rect
+import android.graphics.RectF
 import android.util.AttributeSet
 import android.view.MotionEvent
 import android.view.ScaleGestureDetector
 import android.view.View
+import kotlin.math.abs
 import kotlin.math.min
+import kotlin.math.roundToInt
 
 /**
- * Phase 1 drawing surface.
+ * The drawing surface.
  *
  * - One finger / stylus draws, two fingers pan + pinch-zoom.
- * - Strokes are stored as point lists so undo/redo is a simple re-render.
- *   (Phase 3 replaces this with tile diffs so big canvases stay fast.)
- * - Eraser currently paints white; it becomes a true erase once layers exist.
+ * - The live stroke is drawn into a scratch bitmap and composited at the brush opacity,
+ *   so overlapping parts of one stroke never double-darken.
+ * - When a stroke ends it is baked into the active layer and recorded for undo.
  */
 class CanvasView @JvmOverloads constructor(
     context: Context,
     attrs: AttributeSet? = null
 ) : View(context, attrs) {
 
-    private class Pt(val x: Float, val y: Float, val p: Float)
-
-    private class Stroke(val color: Int, val size: Float) {
-        val pts = ArrayList<Pt>()
-    }
+    val doc = Document()
 
     var brushColor: Int = Color.BLACK
     var brushSize: Float = 12f
+    var brushOpacity: Float = 1f
     var eraser: Boolean = false
 
-    private val bitmap = Bitmap.createBitmap(DOC_SIZE, DOC_SIZE, Bitmap.Config.ARGB_8888)
-    private val bmpCanvas = Canvas(bitmap)
+    /** When > 0, a circle showing the brush size is drawn in the middle of the view. */
+    var previewSize: Float = 0f
 
-    private val strokes = ArrayList<Stroke>()
-    private val redoStack = ArrayList<Stroke>()
+    var onDocChanged: (() -> Unit)? = null
+    var onBlocked: ((String) -> Unit)? = null
+
+    private val scratch = Bitmap.createBitmap(Document.SIZE, Document.SIZE, Bitmap.Config.ARGB_8888)
+    private val scratchCanvas = Canvas(scratch)
+
     private var current: Stroke? = null
+    private var liveLayer: Layer? = null
 
     private val matrix = Matrix()
     private val inverse = Matrix()
     private val tmp = FloatArray(2)
+    private val vals = FloatArray(9)
+    private val docRect = RectF(0f, 0f, Document.SIZE.toFloat(), Document.SIZE.toFloat())
 
-    private val linePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.STROKE
-        strokeCap = Paint.Cap.ROUND
-        strokeJoin = Paint.Join.ROUND
-    }
-    private val dotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.FILL
-    }
+    private val paperPaint = Paint().apply { color = Color.WHITE }
+    private val layerPaint = Paint(Paint.FILTER_BITMAP_FLAG)
     private val bitmapPaint = Paint(Paint.FILTER_BITMAP_FLAG)
+    private val livePaint = Paint(Paint.FILTER_BITMAP_FLAG)
+    private val ringPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
 
     private var gesturing = false
     private var lastFx = 0f
@@ -64,10 +69,10 @@ class CanvasView @JvmOverloads constructor(
         context,
         object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
             override fun onScale(detector: ScaleGestureDetector): Boolean {
-                matrix.postScale(
-                    detector.scaleFactor, detector.scaleFactor,
-                    detector.focusX, detector.focusY
-                )
+                val cur = currentScale()
+                val target = (cur * detector.scaleFactor).coerceIn(MIN_SCALE, MAX_SCALE)
+                val f = target / cur
+                matrix.postScale(f, f, detector.focusX, detector.focusY)
                 invalidate()
                 return true
             }
@@ -75,43 +80,86 @@ class CanvasView @JvmOverloads constructor(
     )
 
     init {
-        bmpCanvas.drawColor(Color.WHITE)
+        doc.onChanged = {
+            invalidate()
+            onDocChanged?.invoke()
+        }
     }
 
     // ---- public actions ----------------------------------------------------
 
-    fun undo() {
-        if (strokes.isEmpty()) return
-        redoStack.add(strokes.removeAt(strokes.lastIndex))
-        rerender()
+    fun fitToView() {
+        if (width == 0 || height == 0) return
+        val scale = min(width / Document.SIZE.toFloat(), height / Document.SIZE.toFloat()) * 0.95f
+        matrix.reset()
+        matrix.postScale(scale, scale)
+        matrix.postTranslate(
+            (width - Document.SIZE * scale) / 2f,
+            (height - Document.SIZE * scale) / 2f
+        )
+        invalidate()
     }
 
-    fun redo() {
-        if (redoStack.isEmpty()) return
-        strokes.add(redoStack.removeAt(redoStack.lastIndex))
-        rerender()
-    }
-
-    fun clear() {
-        strokes.clear()
-        redoStack.clear()
-        current = null
-        rerender()
+    /** Flattens the visible layers onto white paper. */
+    fun exportBitmap(): Bitmap {
+        val out = Bitmap.createBitmap(Document.SIZE, Document.SIZE, Bitmap.Config.ARGB_8888)
+        drawDocument(Canvas(out), false)
+        return out
     }
 
     // ---- view plumbing -----------------------------------------------------
 
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
         super.onSizeChanged(w, h, oldw, oldh)
-        val scale = min(w / DOC_SIZE.toFloat(), h / DOC_SIZE.toFloat()) * 0.95f
-        matrix.reset()
-        matrix.postScale(scale, scale)
-        matrix.postTranslate((w - DOC_SIZE * scale) / 2f, (h - DOC_SIZE * scale) / 2f)
+        fitToView()
+    }
+
+    private fun currentScale(): Float {
+        matrix.getValues(vals)
+        return vals[Matrix.MSCALE_X]
+    }
+
+    private fun drawDocument(canvas: Canvas, withLive: Boolean) {
+        val group = canvas.saveLayer(docRect, null)
+        canvas.drawRect(docRect, paperPaint)
+        val s = current
+        for (layer in doc.layers) {
+            if (!layer.visible) continue
+            layerPaint.alpha = (layer.opacity * 255f).roundToInt().coerceIn(0, 255)
+            layerPaint.xfermode = layer.blend.xfermode
+            if (withLive && s != null && layer === liveLayer) {
+                val lg = canvas.saveLayer(docRect, layerPaint)
+                canvas.drawBitmap(layer.bitmap, 0f, 0f, bitmapPaint)
+                livePaint.alpha = StrokeRenderer.alphaOf(s)
+                livePaint.xfermode = if (s.erase) StrokeRenderer.dstOut else null
+                canvas.drawBitmap(scratch, 0f, 0f, livePaint)
+                canvas.restoreToCount(lg)
+            } else {
+                canvas.drawBitmap(layer.bitmap, 0f, 0f, layerPaint)
+            }
+        }
+        canvas.restoreToCount(group)
     }
 
     override fun onDraw(canvas: Canvas) {
-        canvas.drawColor(0xFF303030.toInt())
-        canvas.drawBitmap(bitmap, matrix, bitmapPaint)
+        canvas.drawColor(0xFF1E1E1E.toInt())
+        canvas.save()
+        canvas.concat(matrix)
+        drawDocument(canvas, true)
+        canvas.restore()
+
+        if (previewSize > 0f) {
+            val r = previewSize * currentScale() / 2f
+            val cx = width / 2f
+            val cy = height / 2f
+            val d = resources.displayMetrics.density
+            ringPaint.strokeWidth = 3f * d
+            ringPaint.color = Color.BLACK
+            canvas.drawCircle(cx, cy, r, ringPaint)
+            ringPaint.strokeWidth = 1.5f * d
+            ringPaint.color = Color.WHITE
+            canvas.drawCircle(cx, cy, r, ringPaint)
+        }
     }
 
     override fun onTouchEvent(e: MotionEvent): Boolean {
@@ -150,7 +198,7 @@ class CanvasView @JvmOverloads constructor(
                 }
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                if (!gesturing) endStroke()
+                if (!gesturing) finishStroke(e)
                 gesturing = false
             }
         }
@@ -196,78 +244,98 @@ class CanvasView @JvmOverloads constructor(
     }
 
     private fun beginStroke(e: MotionEvent) {
-        val s = Stroke(if (eraser) Color.WHITE else brushColor, brushSize)
+        val layer = doc.active
+        if (!layer.visible) {
+            onBlocked?.invoke("This layer is hidden")
+            return
+        }
+        if (layer.locked) {
+            onBlocked?.invoke("This layer is locked")
+            return
+        }
+        val s = Stroke(brushColor, brushSize, brushOpacity, eraser)
         current = s
+        liveLayer = layer
         val d = toDoc(e.x, e.y)
         val pt = Pt(d[0], d[1], pressure(e, -1))
-        s.pts.add(pt)
-        drawDot(bmpCanvas, s, pt)
+        s.add(pt)
+        StrokeRenderer.drawDot(scratchCanvas, s, pt)
         invalidate()
     }
 
     private fun extendStroke(e: MotionEvent) {
         val s = current ?: return
         for (h in 0 until e.historySize) {
-            addPoint(s, e.getHistoricalX(h), e.getHistoricalY(h), pressure(e, h))
+            smoothAppend(s, e.getHistoricalX(h), e.getHistoricalY(h), pressure(e, h))
         }
-        addPoint(s, e.x, e.y, pressure(e, -1))
+        smoothAppend(s, e.x, e.y, pressure(e, -1))
         invalidate()
     }
 
-    private fun addPoint(s: Stroke, x: Float, y: Float, p: Float) {
+    private fun smoothAppend(s: Stroke, x: Float, y: Float, p: Float) {
         val d = toDoc(x, y)
-        val last = s.pts.lastOrNull() ?: return
-        val pt = Pt(
+        val last = s.pts[s.pts.size - 1]
+        appendPoint(
+            s,
             last.x + (d[0] - last.x) * SMOOTHING,
             last.y + (d[1] - last.y) * SMOOTHING,
             p
         )
-        s.pts.add(pt)
-        drawSegment(bmpCanvas, s, last, pt)
     }
 
-    private fun endStroke() {
-        current?.let {
-            strokes.add(it)
-            redoStack.clear()
+    private fun appendPoint(s: Stroke, x: Float, y: Float, p: Float) {
+        val last = s.pts[s.pts.size - 1]
+        val pt = Pt(x, y, p)
+        s.add(pt)
+        StrokeRenderer.drawSegment(scratchCanvas, s, last, pt)
+    }
+
+    private fun clearScratch(r: Rect) {
+        scratchCanvas.save()
+        scratchCanvas.clipRect(r)
+        scratchCanvas.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
+        scratchCanvas.restore()
+    }
+
+    private fun finishStroke(e: MotionEvent) {
+        val s = current ?: return
+        val layer = liveLayer ?: return
+
+        // Snap the end of the stroke to where the finger actually lifted.
+        val d = toDoc(e.x, e.y)
+        val last = s.pts[s.pts.size - 1]
+        if (abs(d[0] - last.x) + abs(d[1] - last.y) > 0.5f) {
+            appendPoint(s, d[0], d[1], last.p)
         }
+
+        val r = Rect()
+        s.inflatedBounds().roundOut(r)
         current = null
+        liveLayer = null
+        if (!r.intersect(0, 0, Document.SIZE, Document.SIZE)) {
+            invalidate()
+            return
+        }
+        layer.canvas.drawBitmap(scratch, r, r, StrokeRenderer.paintForCommit(s))
+        clearScratch(r)
+        layer.strokes.add(s)
+        doc.push(StrokeCmd(layer, s))
+        doc.changed()
     }
 
     private fun cancelStroke() {
+        val s = current ?: return
+        val r = Rect()
+        s.inflatedBounds().roundOut(r)
+        if (r.intersect(0, 0, Document.SIZE, Document.SIZE)) clearScratch(r)
         current = null
-        rerender()
-    }
-
-    // ---- rendering ---------------------------------------------------------
-
-    private fun widthFor(s: Stroke, p: Float): Float = s.size * (0.25f + 0.75f * p)
-
-    private fun drawDot(c: Canvas, s: Stroke, pt: Pt) {
-        dotPaint.color = s.color
-        c.drawCircle(pt.x, pt.y, widthFor(s, pt.p) / 2f, dotPaint)
-    }
-
-    private fun drawSegment(c: Canvas, s: Stroke, a: Pt, b: Pt) {
-        linePaint.color = s.color
-        linePaint.strokeWidth = widthFor(s, (a.p + b.p) / 2f)
-        c.drawLine(a.x, a.y, b.x, b.y, linePaint)
-    }
-
-    private fun rerender() {
-        bmpCanvas.drawColor(Color.WHITE)
-        for (s in strokes) {
-            if (s.pts.isEmpty()) continue
-            drawDot(bmpCanvas, s, s.pts[0])
-            for (i in 1 until s.pts.size) {
-                drawSegment(bmpCanvas, s, s.pts[i - 1], s.pts[i])
-            }
-        }
+        liveLayer = null
         invalidate()
     }
 
     companion object {
-        private const val DOC_SIZE = 2048
         private const val SMOOTHING = 0.55f
+        private const val MIN_SCALE = 0.05f
+        private const val MAX_SCALE = 32f
     }
 }
