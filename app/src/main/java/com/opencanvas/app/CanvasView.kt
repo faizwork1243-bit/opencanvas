@@ -7,6 +7,7 @@ import android.graphics.Color
 import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.PorterDuff
+import android.graphics.PorterDuffXfermode
 import android.graphics.Rect
 import android.graphics.RectF
 import android.os.Handler
@@ -23,19 +24,20 @@ import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
 
+enum class Tool { BRUSH, SMUDGE, ERASE }
+
 /**
  * The drawing surface.
  *
  * Gestures:
- * - one finger / stylus draws
- * - two fingers pan + pinch-zoom
+ * - one finger / stylus draws, two fingers pan + pinch-zoom
  * - quick tap with two fingers = undo, with three fingers = redo
- * - draw, then hold still before lifting = the stroke snaps to a straight line
+ * - draw, then hold still before lifting = QuickShape (line, arc, circle, ellipse, rectangle, polygon)
  * - touch and hold without moving = eyedropper
  *
- * The live stroke is drawn into a scratch bitmap and composited at the brush opacity,
- * so overlapping parts of one stroke never double-darken. When a stroke ends it is baked
- * into the active layer and recorded for undo.
+ * Brush and eraser strokes are stamped into a scratch bitmap and composited at the brush
+ * opacity when the stroke ends. Smudge works directly on the layer. Undo stores the pixels of
+ * the touched rectangle before and after, so it works for every kind of stroke.
  */
 class CanvasView @JvmOverloads constructor(
     context: Context,
@@ -44,10 +46,11 @@ class CanvasView @JvmOverloads constructor(
 
     val doc = Document()
 
+    var tool: Tool = Tool.BRUSH
+    var brush: BrushSpec = Brushes.PENCIL
     var brushColor: Int = Color.BLACK
     var brushSize: Float = 12f
     var brushOpacity: Float = 1f
-    var eraser: Boolean = false
 
     /** When > 0, a circle showing the brush size is drawn in the middle of the view. */
     var previewSize: Float = 0f
@@ -62,9 +65,21 @@ class CanvasView @JvmOverloads constructor(
 
     private val scratch = Bitmap.createBitmap(Document.SIZE, Document.SIZE, Bitmap.Config.ARGB_8888)
     private val scratchCanvas = Canvas(scratch)
+    private var backup: Bitmap? = null
 
-    private var current: Stroke? = null
+    // the stroke in progress
+    private var drawing = false
     private var liveLayer: Layer? = null
+    private var painter: BrushPainter? = null
+    private var smudger: SmudgePainter? = null
+    private var liveOpacity = 1f
+    private var liveErase = false
+    private var strokeSpec: BrushSpec? = null
+    private var strokeTip: Tip? = null
+    private var strokeSize = 12f
+    private var strokeColor = Color.BLACK
+    private var strokeSeed = 0L
+    private val pts = ArrayList<Pt>()
 
     private val matrix = Matrix()
     private val inverse = Matrix()
@@ -72,10 +87,13 @@ class CanvasView @JvmOverloads constructor(
     private val vals = FloatArray(9)
     private val docRect = RectF(0f, 0f, Document.SIZE.toFloat(), Document.SIZE.toFloat())
 
+    private val dstOut = PorterDuffXfermode(PorterDuff.Mode.DST_OUT)
     private val paperPaint = Paint().apply { color = Color.WHITE }
     private val layerPaint = Paint(Paint.FILTER_BITMAP_FLAG)
     private val bitmapPaint = Paint(Paint.FILTER_BITMAP_FLAG)
     private val livePaint = Paint(Paint.FILTER_BITMAP_FLAG)
+    private val commitPaint = Paint()
+    private val copyPaint = Paint().apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC) }
     private val ringPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
     private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
 
@@ -172,16 +190,16 @@ class CanvasView @JvmOverloads constructor(
     private fun drawDocument(canvas: Canvas, withLive: Boolean) {
         val group = canvas.saveLayer(docRect, null)
         canvas.drawRect(docRect, paperPaint)
-        val s = current
         for (layer in doc.layers) {
             if (!layer.visible) continue
             layerPaint.alpha = (layer.opacity * 255f).roundToInt().coerceIn(0, 255)
             layerPaint.xfermode = layer.blend.xfermode
-            if (withLive && s != null && layer === liveLayer) {
+            val live = withLive && drawing && painter != null && layer === liveLayer
+            if (live) {
                 val lg = canvas.saveLayer(docRect, layerPaint)
                 canvas.drawBitmap(layer.bitmap, 0f, 0f, bitmapPaint)
-                livePaint.alpha = StrokeRenderer.alphaOf(s)
-                livePaint.xfermode = if (s.erase) StrokeRenderer.dstOut else null
+                livePaint.alpha = (liveOpacity * 255f).roundToInt().coerceIn(0, 255)
+                livePaint.xfermode = if (liveErase) dstOut else null
                 canvas.drawBitmap(scratch, 0f, 0f, livePaint)
                 canvas.restoreToCount(lg)
             } else {
@@ -331,10 +349,9 @@ class CanvasView @JvmOverloads constructor(
                         handler.removeCallbacks(pickRunnable)
                     }
                     if (straight) {
-                        val s = current
-                        if (s != null && shapeFollows) {
+                        if (shapeFollows && drawing) {
                             val d = toDoc(e.x, e.y)
-                            rebuildLine(s, d[0], d[1])
+                            rebuildLine(d[0], d[1])
                         }
                     } else {
                         extendStroke(e)
@@ -453,41 +470,66 @@ class CanvasView @JvmOverloads constructor(
             onBlocked?.invoke("This layer is locked")
             return
         }
-        val s = Stroke(brushColor, brushSize, brushOpacity, eraser)
-        current = s
         liveLayer = layer
         val d = toDoc(e.x, e.y)
-        val pt = Pt(d[0], d[1], pressure(e, -1))
-        s.add(pt)
-        StrokeRenderer.drawDot(scratchCanvas, s, pt)
+        val p = pressure(e, -1)
+        pts.clear()
+        pts.add(Pt(d[0], d[1], p))
+        strokeSeed = System.nanoTime()
+        strokeSize = brushSize
+
+        if (tool == Tool.SMUDGE) {
+            val bk = backup ?: Bitmap.createBitmap(
+                Document.SIZE, Document.SIZE, Bitmap.Config.ARGB_8888
+            ).also { backup = it }
+            Canvas(bk).drawBitmap(layer.bitmap, 0f, 0f, copyPaint)
+            val sp = SmudgePainter(
+                layer.bitmap, layer.canvas,
+                TipCache.get(context, Brushes.SMUDGE_TIP),
+                strokeSize, max(brushOpacity, 0.2f), strokeSeed
+            )
+            smudger = sp
+            sp.begin(d[0], d[1], p)
+        } else {
+            val spec = brush
+            strokeSpec = spec
+            strokeTip = TipCache.get(context, spec)
+            liveErase = tool == Tool.ERASE
+            liveOpacity = brushOpacity
+            strokeColor = if (liveErase) Color.BLACK else brushColor
+            val pa = BrushPainter(scratchCanvas, spec, strokeTip!!, strokeSize, strokeColor, strokeSeed)
+            painter = pa
+            pa.begin(d[0], d[1], p)
+        }
+        drawing = true
         invalidate()
+    }
+
+    private fun smoothingFactor(): Float {
+        val s = if (tool == Tool.SMUDGE) 0.2f else brush.smoothing
+        return 1f - 0.88f * s
     }
 
     private fun extendStroke(e: MotionEvent) {
-        val s = current ?: return
+        if (!drawing) return
         for (h in 0 until e.historySize) {
-            smoothAppend(s, e.getHistoricalX(h), e.getHistoricalY(h), pressure(e, h))
+            smoothAppend(e.getHistoricalX(h), e.getHistoricalY(h), pressure(e, h))
         }
-        smoothAppend(s, e.x, e.y, pressure(e, -1))
+        smoothAppend(e.x, e.y, pressure(e, -1))
         invalidate()
     }
 
-    private fun smoothAppend(s: Stroke, x: Float, y: Float, p: Float) {
+    private fun smoothAppend(x: Float, y: Float, p: Float) {
         val d = toDoc(x, y)
-        val last = s.pts[s.pts.size - 1]
-        appendPoint(
-            s,
-            last.x + (d[0] - last.x) * SMOOTHING,
-            last.y + (d[1] - last.y) * SMOOTHING,
-            p
-        )
+        val last = pts[pts.size - 1]
+        val f = smoothingFactor()
+        addPoint(last.x + (d[0] - last.x) * f, last.y + (d[1] - last.y) * f, p)
     }
 
-    private fun appendPoint(s: Stroke, x: Float, y: Float, p: Float) {
-        val last = s.pts[s.pts.size - 1]
-        val pt = Pt(x, y, p)
-        s.add(pt)
-        StrokeRenderer.drawSegment(scratchCanvas, s, last, pt)
+    private fun addPoint(x: Float, y: Float, p: Float) {
+        pts.add(Pt(x, y, p))
+        painter?.moveTo(x, y, p)
+        smudger?.moveTo(x, y, p)
     }
 
     private fun clearScratch(r: Rect) {
@@ -497,17 +539,36 @@ class CanvasView @JvmOverloads constructor(
         scratchCanvas.restore()
     }
 
+    /** Re-stamps the whole stroke along a new path (used by QuickShape). */
+    private fun replay(xs: FloatArray, ys: FloatArray, p: Float) {
+        val spec = strokeSpec ?: return
+        val tip = strokeTip ?: return
+        val old = painter?.dirtyRect()
+        if (old != null) clearScratch(old)
+        val pa = BrushPainter(scratchCanvas, spec, tip, strokeSize, strokeColor, strokeSeed)
+        pa.begin(xs[0], ys[0], p)
+        for (i in 1 until xs.size) pa.moveTo(xs[i], ys[i], p)
+        painter = pa
+        invalidate()
+    }
+
+    private fun rebuildLine(x: Float, y: Float) {
+        val first = pts[0]
+        replay(floatArrayOf(first.x, x), floatArrayOf(first.y, y), first.p)
+    }
+
     /** QuickShape: after holding still, snap the stroke to a line, arc, circle, ellipse, rectangle or polygon. */
     private fun snapToShape() {
-        val s = current ?: return
-        if (straight || gesturing || picking || s.pts.size < 3) return
+        if (!drawing || straight || gesturing || picking || tool == Tool.SMUDGE || pts.size < 3) return
         val d = toDoc(lastX, lastY)
-        val n = s.pts.size
+        val n = pts.size
         val xs = FloatArray(n + 1)
         val ys = FloatArray(n + 1)
+        var sum = 0f
         for (i in 0 until n) {
-            xs[i] = s.pts[i].x
-            ys[i] = s.pts[i].y
+            xs[i] = pts[i].x
+            ys[i] = pts[i].y
+            sum += pts[i].p
         }
         xs[n] = d[0]
         ys[n] = d[1]
@@ -516,76 +577,87 @@ class CanvasView @JvmOverloads constructor(
         shapeFollows = res.kind == ShapeFit.LINE
         performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
         if (shapeFollows) {
-            rebuildLine(s, d[0], d[1])
+            rebuildLine(d[0], d[1])
         } else {
-            rebuildShape(s, res)
+            replay(res.xs, res.ys, sum / n)
         }
-    }
-
-    private fun rebuildShape(s: Stroke, res: ShapeResult) {
-        val old = Rect()
-        s.inflatedBounds().roundOut(old)
-        if (old.intersect(0, 0, Document.SIZE, Document.SIZE)) clearScratch(old)
-        var sum = 0f
-        for (pt in s.pts) sum += pt.p
-        val p = sum / s.pts.size
-        s.replaceWith(res.xs, res.ys, p)
-        StrokeRenderer.drawDot(scratchCanvas, s, s.pts[0])
-        for (i in 1 until s.pts.size) {
-            StrokeRenderer.drawSegment(scratchCanvas, s, s.pts[i - 1], s.pts[i])
-        }
-        invalidate()
-    }
-
-    private fun rebuildLine(s: Stroke, x: Float, y: Float) {
-        val old = Rect()
-        s.inflatedBounds().roundOut(old)
-        if (old.intersect(0, 0, Document.SIZE, Document.SIZE)) clearScratch(old)
-        val first = s.pts[0]
-        s.replaceWithLine(first, Pt(x, y, first.p))
-        StrokeRenderer.drawDot(scratchCanvas, s, s.pts[0])
-        StrokeRenderer.drawSegment(scratchCanvas, s, s.pts[0], s.pts[1])
-        invalidate()
     }
 
     private fun finishStroke(e: MotionEvent) {
-        val s = current ?: return
+        if (!drawing) return
         val layer = liveLayer ?: return
 
+        // Snap the end of the stroke to where the finger actually lifted.
         val d = toDoc(e.x, e.y)
         if (straight) {
-            if (shapeFollows) rebuildLine(s, d[0], d[1])
+            if (shapeFollows) rebuildLine(d[0], d[1])
         } else {
-            // Snap the end of the stroke to where the finger actually lifted.
-            val last = s.pts[s.pts.size - 1]
+            val last = pts[pts.size - 1]
             if (abs(d[0] - last.x) + abs(d[1] - last.y) > 0.5f) {
-                appendPoint(s, d[0], d[1], last.p)
+                addPoint(d[0], d[1], last.p)
             }
         }
 
-        val r = Rect()
-        s.inflatedBounds().roundOut(r)
-        current = null
+        val sm = smudger
+        val pa = painter
+        val r = if (sm != null) sm.dirtyRect() else pa?.dirtyRect()
+        val erase = liveErase
+        val opacity = liveOpacity
+        drawing = false
         liveLayer = null
         straight = false
         shapeFollows = false
-        if (!r.intersect(0, 0, Document.SIZE, Document.SIZE)) {
+
+        if (r == null) {
+            painter = null
+            smudger = null
             invalidate()
             return
         }
-        layer.canvas.drawBitmap(scratch, r, r, StrokeRenderer.paintForCommit(s))
-        clearScratch(r)
-        layer.strokes.add(s)
-        doc.push(StrokeCmd(layer, s))
+
+        if (sm != null) {
+            val bk = backup
+            if (bk != null) {
+                val before = Bitmap.createBitmap(bk, r.left, r.top, r.width(), r.height())
+                val after = Bitmap.createBitmap(layer.bitmap, r.left, r.top, r.width(), r.height())
+                doc.push(PatchCmd(layer, r.left, r.top, before, after))
+            }
+        } else {
+            val before = Bitmap.createBitmap(layer.bitmap, r.left, r.top, r.width(), r.height())
+            commitPaint.alpha = (opacity * 255f).roundToInt().coerceIn(0, 255)
+            commitPaint.xfermode = if (erase) dstOut else null
+            layer.canvas.drawBitmap(scratch, r, r, commitPaint)
+            val after = Bitmap.createBitmap(layer.bitmap, r.left, r.top, r.width(), r.height())
+            clearScratch(r)
+            doc.push(PatchCmd(layer, r.left, r.top, before, after))
+        }
+        painter = null
+        smudger = null
         doc.changed()
     }
 
     private fun cancelStroke() {
-        val s = current ?: return
-        val r = Rect()
-        s.inflatedBounds().roundOut(r)
-        if (r.intersect(0, 0, Document.SIZE, Document.SIZE)) clearScratch(r)
-        current = null
+        if (!drawing) return
+        val pa = painter
+        if (pa != null) {
+            val r = pa.dirtyRect()
+            if (r != null) clearScratch(r)
+        }
+        val sm = smudger
+        val layer = liveLayer
+        if (sm != null && layer != null) {
+            val r = sm.dirtyRect()
+            val bk = backup
+            if (r != null && bk != null) {
+                layer.canvas.save()
+                layer.canvas.clipRect(r)
+                layer.canvas.drawBitmap(bk, 0f, 0f, copyPaint)
+                layer.canvas.restore()
+            }
+        }
+        painter = null
+        smudger = null
+        drawing = false
         liveLayer = null
         straight = false
         shapeFollows = false
@@ -593,7 +665,6 @@ class CanvasView @JvmOverloads constructor(
     }
 
     companion object {
-        private const val SMOOTHING = 0.55f
         private const val MIN_SCALE = 0.05f
         private const val MAX_SCALE = 32f
         private const val MAX_POINTERS = 16
