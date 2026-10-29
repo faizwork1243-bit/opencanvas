@@ -10,27 +10,43 @@ import java.io.File
 import java.io.FileOutputStream
 import kotlin.math.max
 
-/** Keeps the user's own brushes on the phone (brushes.json plus tip images). */
+/**
+ * Keeps the user's brushes on the phone: their own custom brushes, plus any edits made to the
+ * built-in brushes (so a built-in can be reset to its default later).
+ */
 class BrushStore(private val context: Context) {
 
     val custom = ArrayList<BrushSpec>()
+    private val overrides = LinkedHashMap<String, BrushSpec>()
     private val file = File(context.filesDir, "brushes.json")
 
     init {
         load()
     }
 
-    fun all(): List<BrushSpec> = Brushes.ALL + custom
+    fun all(): List<BrushSpec> = Brushes.ALL.map { overrides[it.id] ?: it } + custom
 
     fun find(id: String): BrushSpec? = all().firstOrNull { it.id == id }
 
     fun newId(): String = "c" + java.lang.Long.toString(System.currentTimeMillis(), 36)
 
+    fun isModified(id: String): Boolean = overrides.containsKey(id)
+
+    /** Saves a custom brush, or an edited copy of a built-in brush. */
     fun save(spec: BrushSpec) {
-        val s = spec.copy(builtin = false)
-        val i = custom.indexOfFirst { it.id == s.id }
-        if (i >= 0) custom[i] = s else custom.add(s)
+        if (Brushes.byId(spec.id) != null) {
+            overrides[spec.id] = spec.copy(builtin = true)
+        } else {
+            val s = spec.copy(builtin = false)
+            val i = custom.indexOfFirst { it.id == s.id }
+            if (i >= 0) custom[i] = s else custom.add(s)
+        }
         persist()
+    }
+
+    /** Puts a built-in brush back to its factory settings. */
+    fun reset(id: String) {
+        if (overrides.remove(id) != null) persist()
     }
 
     fun delete(id: String) {
@@ -102,10 +118,14 @@ class BrushStore(private val context: Context) {
         o.put("scatter", s.scatter.toDouble())
         o.put("grain", s.grain.toDouble())
         o.put("smoothing", s.smoothing.toDouble())
+        o.put("count", s.count)
+        o.put("tipScale", s.tipScale.toDouble())
+        o.put("colorJitter", s.colorJitter.toDouble())
+        o.put("category", s.category)
         return o
     }
 
-    private fun fromJson(o: JSONObject): BrushSpec {
+    private fun fromJson(o: JSONObject, builtin: Boolean): BrushSpec {
         val d = BrushSpec(id = "", name = "")
         fun f(key: String, def: Float): Float = o.optDouble(key, def.toDouble()).toFloat()
         val kind = try {
@@ -132,22 +152,46 @@ class BrushStore(private val context: Context) {
             scatter = f("scatter", d.scatter),
             grain = f("grain", d.grain),
             smoothing = f("smoothing", d.smoothing),
-            builtin = false
+            count = o.optInt("count", 1).coerceAtLeast(1),
+            tipScale = f("tipScale", d.tipScale),
+            colorJitter = f("colorJitter", d.colorJitter),
+            category = o.optString("category", Brushes.CUSTOM),
+            builtin = builtin
         )
     }
 
     private fun persist() {
-        val arr = JSONArray()
-        for (s in custom) arr.put(toJson(s))
-        file.writeText(arr.toString())
+        val root = JSONObject()
+        val c = JSONArray()
+        for (s in custom) c.put(toJson(s))
+        val ov = JSONArray()
+        for (s in overrides.values) ov.put(toJson(s))
+        root.put("custom", c)
+        root.put("overrides", ov)
+        file.writeText(root.toString())
     }
 
     private fun load() {
         if (!file.exists()) return
         try {
-            val arr = JSONArray(file.readText())
-            for (i in 0 until arr.length()) {
-                custom.add(fromJson(arr.getJSONObject(i)))
+            val text = file.readText().trim()
+            if (text.startsWith("[")) {
+                // older file: just a list of custom brushes
+                val arr = JSONArray(text)
+                for (i in 0 until arr.length()) custom.add(fromJson(arr.getJSONObject(i), false))
+                return
+            }
+            val root = JSONObject(text)
+            val c = root.optJSONArray("custom")
+            if (c != null) {
+                for (i in 0 until c.length()) custom.add(fromJson(c.getJSONObject(i), false))
+            }
+            val ov = root.optJSONArray("overrides")
+            if (ov != null) {
+                for (i in 0 until ov.length()) {
+                    val s = fromJson(ov.getJSONObject(i), true)
+                    if (Brushes.byId(s.id) != null) overrides[s.id] = s
+                }
             }
         } catch (e: Exception) {
             // a damaged file just means no custom brushes; built-ins still work

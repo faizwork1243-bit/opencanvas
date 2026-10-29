@@ -5,6 +5,7 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.LinearGradient
 import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.Rect
 import android.graphics.RectF
 import android.graphics.Shader
@@ -12,6 +13,7 @@ import android.graphics.drawable.GradientDrawable
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
+import kotlin.math.min
 import android.widget.ScrollView
 import android.widget.TextView
 
@@ -194,5 +196,45 @@ class MaxHeightScrollView(context: Context, private val maxPx: Int) : ScrollView
     override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
         val limited = View.MeasureSpec.makeMeasureSpec(maxPx, View.MeasureSpec.AT_MOST)
         super.onMeasure(widthMeasureSpec, limited)
+    }
+}
+
+/** Small drawn icons, so the app does not depend on emoji or icon fonts. */
+class IconView(context: Context, private val kind: Int) : View(context) {
+    private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE }
+    private val path = Path()
+
+    override fun onDraw(canvas: Canvas) {
+        val w = width.toFloat()
+        val h = height.toFloat()
+        when (kind) {
+            DOTS -> {
+                paint.style = Paint.Style.FILL
+                val r = min(w, h) * 0.09f
+                for (i in -1..1) canvas.drawCircle(w / 2f, h / 2f + i * h * 0.24f, r, paint)
+            }
+            LAYERS -> {
+                paint.strokeWidth = min(w, h) * 0.07f
+                paint.strokeJoin = Paint.Join.ROUND
+                val dx = w * 0.34f
+                val dy = h * 0.17f
+                for (k in 0..2) {
+                    val cy = h * (0.30f + 0.20f * k)
+                    path.reset()
+                    path.moveTo(w / 2f, cy - dy)
+                    path.lineTo(w / 2f + dx, cy)
+                    path.lineTo(w / 2f, cy + dy)
+                    path.lineTo(w / 2f - dx, cy)
+                    path.close()
+                    paint.style = if (k == 0) Paint.Style.FILL else Paint.Style.STROKE
+                    canvas.drawPath(path, paint)
+                }
+            }
+        }
+    }
+
+    companion object {
+        const val DOTS = 0
+        const val LAYERS = 1
     }
 }

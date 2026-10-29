@@ -1,6 +1,8 @@
 package com.opencanvas.app
 
 import android.graphics.Bitmap
+import android.graphics.Paint
+import kotlin.math.roundToInt
 
 /** One undoable step. Every change to the document goes through a Command. */
 interface Command {
@@ -81,6 +83,36 @@ class MoveLayerCmd(private val from: Int, private val to: Int) : Command {
     override fun undo(doc: Document) {
         val l = doc.layers.removeAt(to)
         doc.layers.add(from, l)
+    }
+}
+
+/** Merges a layer into the one below it. */
+class MergeDownCmd(
+    private val upperIndex: Int,
+    private val upper: Layer,
+    private val lower: Layer,
+    private val lowerBefore: Bitmap
+) : Command {
+    private val paint = Paint()
+
+    override fun redo(doc: Document) {
+        paint.alpha = (upper.opacity * 255f).roundToInt().coerceIn(0, 255)
+        paint.xfermode = upper.blend.xfermode
+        lower.canvas.drawBitmap(upper.bitmap, 0f, 0f, paint)
+        doc.layers.remove(upper)
+        doc.active = lower
+    }
+
+    override fun undo(doc: Document) {
+        lower.putPatch(0, 0, lowerBefore)
+        doc.layers.add(upperIndex.coerceAtMost(doc.layers.size), upper)
+        doc.active = upper
+    }
+
+    override val bytes: Long get() = (lowerBefore.byteCount + upper.bitmap.byteCount).toLong()
+
+    override fun release() {
+        lowerBefore.recycle()
     }
 }
 
@@ -191,6 +223,17 @@ class Document {
         val to = from + delta
         if (to < 0 || to >= layers.size) return false
         run(MoveLayerCmd(from, to))
+        return true
+    }
+
+    /** Merges the active layer into the one beneath it. Returns false if that isn't possible. */
+    fun mergeDown(): Boolean {
+        val i = layers.indexOf(active)
+        if (i <= 0) return false
+        val upper = layers[i]
+        val lower = layers[i - 1]
+        if (!upper.visible) return false
+        run(MergeDownCmd(i, upper, lower, lower.snapshot()))
         return true
     }
 

@@ -103,6 +103,7 @@ class CanvasView @JvmOverloads constructor(
     private val pickRunnable = Runnable { startPicking() }
 
     private var gesturing = false
+    private var fingerPan = false
     private var lastFx = 0f
     private var lastFy = 0f
 
@@ -271,14 +272,14 @@ class CanvasView @JvmOverloads constructor(
         // so a quick cancelled three-finger touch still counts as a tap.
         val tapped = tapCandidate && quick && (isUp || maxPointers >= 3)
         if (tapped) {
-            if (maxPointers == 2) {
+            if (maxPointers == 2 && AppSettings.twoFingerUndo) {
                 doc.undo()
-            } else if (maxPointers == 3) {
+            } else if (maxPointers == 3 && AppSettings.threeFingerRedo) {
                 doc.redo()
             }
             return
         }
-        if (maxPointers >= 3) {
+        if (maxPointers >= 3 && AppSettings.threeFingerRedo) {
             val why = if (!tapCandidate) {
                 "fingers moved too much"
             } else if (!quick) {
@@ -311,8 +312,18 @@ class CanvasView @JvmOverloads constructor(
                 picking = false
                 handler.removeCallbacks(holdRunnable)
                 handler.removeCallbacks(pickRunnable)
-                handler.postDelayed(pickRunnable, PICK_DELAY_MS)
-                beginStroke(e)
+                fingerPan = AppSettings.stylusOnly && e.getToolType(0) != MotionEvent.TOOL_TYPE_STYLUS
+                if (fingerPan) {
+                    // stylus-only mode: a finger pans and zooms instead of drawing
+                    gesturing = true
+                    lastFx = e.x
+                    lastFy = e.y
+                } else {
+                    if (AppSettings.eyedropper) {
+                        handler.postDelayed(pickRunnable, AppSettings.pickDelayMs.toLong())
+                    }
+                    beginStroke(e)
+                }
             }
             MotionEvent.ACTION_POINTER_DOWN -> {
                 handler.removeCallbacks(pickRunnable)
@@ -333,7 +344,7 @@ class CanvasView @JvmOverloads constructor(
                 lastY = e.y
                 if (gesturing) {
                     checkTapMovement(e)
-                    if (e.pointerCount >= 2) {
+                    if (e.pointerCount >= 2 || fingerPan) {
                         val fx = focusX(e, -1)
                         val fy = focusY(e, -1)
                         matrix.postTranslate(fx - lastFx, fy - lastFy)
@@ -355,11 +366,13 @@ class CanvasView @JvmOverloads constructor(
                         }
                     } else {
                         extendStroke(e)
-                        if (moved && hypot(e.x - anchorX, e.y - anchorY) > holdSlop) {
+                        if (AppSettings.quickShape && moved &&
+                            hypot(e.x - anchorX, e.y - anchorY) > holdSlop
+                        ) {
                             anchorX = e.x
                             anchorY = e.y
                             handler.removeCallbacks(holdRunnable)
-                            handler.postDelayed(holdRunnable, HOLD_DELAY_MS)
+                            handler.postDelayed(holdRunnable, AppSettings.holdDelayMs.toLong())
                         }
                     }
                 }
@@ -381,6 +394,7 @@ class CanvasView @JvmOverloads constructor(
                     finishMultiTouch(e)
                 }
                 gesturing = false
+                fingerPan = false
             }
         }
         return true
@@ -484,9 +498,8 @@ class CanvasView @JvmOverloads constructor(
             ).also { backup = it }
             Canvas(bk).drawBitmap(layer.bitmap, 0f, 0f, copyPaint)
             val sp = SmudgePainter(
-                layer.bitmap, layer.canvas,
-                TipCache.get(context, Brushes.SMUDGE_TIP),
-                strokeSize, max(brushOpacity, 0.2f), strokeSeed
+                layer.bitmap, bk, AppSettings.smudge(),
+                strokeSize, max(brushOpacity, 0.05f), strokeSeed
             )
             smudger = sp
             sp.begin(d[0], d[1], p)
@@ -559,7 +572,11 @@ class CanvasView @JvmOverloads constructor(
 
     /** QuickShape: after holding still, snap the stroke to a line, arc, circle, ellipse, rectangle or polygon. */
     private fun snapToShape() {
-        if (!drawing || straight || gesturing || picking || tool == Tool.SMUDGE || pts.size < 3) return
+        if (!AppSettings.quickShape || !drawing || straight || gesturing || picking ||
+            tool == Tool.SMUDGE || pts.size < 3
+        ) {
+            return
+        }
         val d = toDoc(lastX, lastY)
         val n = pts.size
         val xs = FloatArray(n + 1)
@@ -575,7 +592,7 @@ class CanvasView @JvmOverloads constructor(
         val res = ShapeFit.recognize(xs, ys)
         straight = true
         shapeFollows = res.kind == ShapeFit.LINE
-        performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+        if (AppSettings.haptics) performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
         if (shapeFollows) {
             rebuildLine(d[0], d[1])
         } else {

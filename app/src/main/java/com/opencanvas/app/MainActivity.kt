@@ -51,6 +51,7 @@ class MainActivity : Activity() {
 
     private val recent = ArrayList<Int>()
     private val previewCache = HashMap<BrushSpec, Bitmap>()
+    private var brushListDirty = true
     private var dragLayer: Layer? = null
     private var dragBefore: LayerProps? = null
 
@@ -63,6 +64,7 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        AppSettings.init(this)
         store = BrushStore(this)
         canvas = CanvasView(this)
         val prefs = getSharedPreferences("carnival", MODE_PRIVATE)
@@ -101,7 +103,6 @@ class MainActivity : Activity() {
         canvas.onDocChanged = { refreshLayerPanel() }
         refreshLayerPanel()
         refreshRecent()
-        refreshBrushList()
         updateToolButtons()
     }
 
@@ -130,7 +131,10 @@ class MainActivity : Activity() {
     private fun togglePanel(panel: View) {
         val show = panel.visibility != View.VISIBLE
         hidePanels()
-        if (show) panel.visibility = View.VISIBLE
+        if (show) {
+            if (panel === brushPanel && brushListDirty) refreshBrushList()
+            panel.visibility = View.VISIBLE
+        }
         updateToolButtons()
     }
 
@@ -168,8 +172,12 @@ class MainActivity : Activity() {
             }
         }
         smudgeBtn = topChip("Smudge") {
-            canvas.tool = Tool.SMUDGE
-            updateToolButtons()
+            if (canvas.tool == Tool.SMUDGE) {
+                openSmudgeSettings()
+            } else {
+                canvas.tool = Tool.SMUDGE
+                updateToolButtons()
+            }
         }
         eraseBtn = topChip("Erase") {
             canvas.tool = Tool.ERASE
@@ -208,12 +216,14 @@ class MainActivity : Activity() {
         pm.menu.add("Save PNG")
         pm.menu.add("Clear layer")
         pm.menu.add("Fit to screen")
+        pm.menu.add("Settings")
         pm.menu.add("Gesture guide")
         pm.setOnMenuItemClickListener { item ->
             when (item.title.toString()) {
                 "Save PNG" -> savePng()
                 "Clear layer" -> canvas.doc.clearActive()
                 "Fit to screen" -> canvas.fitToView()
+                "Settings" -> openAppSettings()
                 "Gesture guide" -> showGuide()
             }
             true
@@ -228,7 +238,8 @@ class MainActivity : Activity() {
             "Redo: tap once with three fingers\n" +
             "Perfect shapes: draw a line, arc, circle, oval, rectangle or triangle, then hold still before lifting\n" +
             "Eyedropper: touch and hold without moving\n" +
-            "Brushes: tap Brush again to open the brush library; long-press a brush to edit it"
+            "Brushes: tap Brush again to open the brush library; tap the dots on a brush to edit, reset or delete it\n" +
+            "Smudge: tap Smudge again to change its settings"
         AlertDialog.Builder(this)
             .setTitle("Gestures")
             .setMessage(text)
@@ -336,7 +347,12 @@ class MainActivity : Activity() {
         title.textSize = 16f
         header.addView(title, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         header.addView(Ui.chip(this, "+ New") {
-            openStudio(canvas.brush.copy(id = store.newId(), name = "New brush", builtin = false), true)
+            openStudio(
+                canvas.brush.copy(
+                    id = store.newId(), name = "New brush", builtin = false, category = Brushes.CUSTOM
+                ),
+                true
+            )
         }, barParams())
         header.addView(Ui.chip(this, "Image tip") { pickTipImage() }, barParams())
         brushPanel.addView(header)
@@ -355,42 +371,63 @@ class MainActivity : Activity() {
     private fun refreshBrushList() {
         if (!::brushList.isInitialized) return
         brushList.removeAllViews()
-        for (spec in store.all()) brushList.addView(makeBrushRow(spec))
+        val all = store.all()
+        for (cat in Brushes.CATEGORIES + Brushes.CUSTOM) {
+            val inCat = all.filter { it.category == cat }
+            if (inCat.isEmpty()) continue
+            val header = TextView(this)
+            header.text = cat.uppercase(Locale.US)
+            header.setTextColor(0xFF9A9AA0.toInt())
+            header.textSize = 11f
+            header.setPadding(dp(4), dp(8), 0, dp(2))
+            brushList.addView(header)
+            for (spec in inCat) brushList.addView(makeBrushRow(spec))
+        }
+        brushListDirty = false
     }
 
     private fun makeBrushRow(spec: BrushSpec): View {
         val row = LinearLayout(this)
         row.orientation = LinearLayout.HORIZONTAL
         row.gravity = Gravity.CENTER_VERTICAL
-        row.setPadding(dp(6), dp(4), dp(6), dp(4))
+        row.setPadding(dp(6), dp(2), dp(2), dp(2))
         val bg = if (spec.id == canvas.brush.id) 0xFF2C5AA0.toInt() else 0xFF2A2A2C.toInt()
         row.background = Ui.rounded(bg, dp(8).toFloat())
 
         val img = ImageView(this)
         val bmp = previewCache.getOrPut(spec) {
-            BrushPreview.render(this, spec, dp(150), dp(40), Color.WHITE)
+            BrushPreview.render(this, spec, dp(130), dp(36), Color.WHITE)
         }
         img.setImageBitmap(bmp)
 
+        val label = if (spec.builtin) {
+            if (store.isModified(spec.id)) spec.name + "  (edited)" else spec.name
+        } else {
+            spec.name
+        }
         val name = TextView(this)
-        name.text = if (spec.builtin) spec.name else spec.name + "  *"
+        name.text = label
         name.setTextColor(Color.WHITE)
-        name.textSize = 14f
+        name.textSize = 13f
         val np = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         np.leftMargin = dp(8)
 
-        row.addView(img, LinearLayout.LayoutParams(dp(150), dp(40)))
+        val dots = IconView(this, IconView.DOTS)
+        dots.setOnClickListener { showBrushMenu(spec, dots) }
+
+        row.addView(img, LinearLayout.LayoutParams(dp(130), dp(36)))
         row.addView(name, np)
+        row.addView(dots, LinearLayout.LayoutParams(dp(36), dp(40)))
         row.setOnClickListener { selectBrush(spec) }
         row.setOnLongClickListener {
-            showBrushMenu(spec, row)
+            showBrushMenu(spec, dots)
             true
         }
 
         val lp = LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
         )
-        lp.setMargins(0, dp(3), 0, dp(3))
+        lp.setMargins(0, dp(2), 0, dp(2))
         row.layoutParams = lp
         return row
     }
@@ -399,21 +436,28 @@ class MainActivity : Activity() {
         canvas.brush = spec
         canvas.tool = Tool.BRUSH
         getSharedPreferences("carnival", MODE_PRIVATE).edit().putString("brush", spec.id).apply()
-        refreshBrushList()
+        brushListDirty = true
+        hidePanels()
         updateToolButtons()
     }
 
     private fun showBrushMenu(spec: BrushSpec, anchor: View) {
         val pm = PopupMenu(this, anchor)
-        if (!spec.builtin) pm.menu.add("Edit")
+        pm.menu.add("Edit")
         pm.menu.add("Duplicate")
+        if (spec.builtin && store.isModified(spec.id)) pm.menu.add("Reset to default")
         if (!spec.builtin) pm.menu.add("Delete")
         pm.setOnMenuItemClickListener { item ->
             when (item.title.toString()) {
                 "Edit" -> openStudio(spec, false)
                 "Duplicate" -> openStudio(
-                    spec.copy(id = store.newId(), name = spec.name + " copy", builtin = false), true
+                    spec.copy(
+                        id = store.newId(), name = spec.name + " copy",
+                        builtin = false, category = Brushes.CUSTOM
+                    ),
+                    true
                 )
+                "Reset to default" -> resetBrush(spec)
                 "Delete" -> confirmDelete(spec)
             }
             true
@@ -421,11 +465,21 @@ class MainActivity : Activity() {
         pm.show()
     }
 
+    private fun resetBrush(spec: BrushSpec) {
+        store.reset(spec.id)
+        toast(spec.name + " reset to default")
+        val fresh = store.find(spec.id) ?: Brushes.PENCIL
+        if (canvas.brush.id == spec.id) canvas.brush = fresh
+        brushListDirty = true
+        refreshBrushList()
+    }
+
     private fun confirmDelete(spec: BrushSpec) {
         AlertDialog.Builder(this)
             .setTitle("Delete \"" + spec.name + "\"?")
             .setPositiveButton("Delete") { _, _ ->
                 store.delete(spec.id)
+                brushListDirty = true
                 if (canvas.brush.id == spec.id) selectBrush(Brushes.PENCIL) else refreshBrushList()
             }
             .setNegativeButton("Cancel", null)
@@ -452,7 +506,7 @@ class MainActivity : Activity() {
                     val spec = BrushSpec(
                         id = store.newId(), name = "Image brush", tip = TipKind.IMAGE, tipFile = file,
                         spacing = 0.15f, hardness = 1f, flow = 0.9f, sizePressure = 0.5f,
-                        smoothing = 0.3f
+                        smoothing = 0.3f, category = Brushes.CUSTOM
                     )
                     openStudio(spec, true)
                 }
@@ -518,31 +572,35 @@ class MainActivity : Activity() {
         nameEdit.hint = "Brush name"
         content.addView(nameEdit)
 
-        val tipChips = ArrayList<Pair<TextView, TipKind>>()
-        fun updateTipChips() {
-            for ((chip, kind) in tipChips) Ui.setActive(this, chip, spec.tip == kind)
-        }
-        val tipRow = LinearLayout(this)
-        tipRow.orientation = LinearLayout.HORIZONTAL
-        fun addTip(label: String, kind: TipKind) {
-            val chip = Ui.chip(this, label) {
-                spec = spec.copy(tip = kind)
-                updateTipChips()
-                refreshPreview()
+        val tipBtn = Ui.chip(this, "Tip: " + spec.tip.label + "  \u25BE") {}
+        tipBtn.setOnClickListener {
+            val tm = PopupMenu(this, tipBtn)
+            for (k in TipKind.values()) {
+                if (k == TipKind.IMAGE && spec.tipFile == null) continue
+                tm.menu.add(k.label)
             }
-            tipChips.add(Pair(chip, kind))
-            tipRow.addView(chip, barParams())
+            tm.setOnMenuItemClickListener { item ->
+                val kind = TipKind.values().firstOrNull { it.label == item.title.toString() }
+                if (kind != null) {
+                    spec = spec.copy(tip = kind)
+                    tipBtn.text = "Tip: " + kind.label + "  \u25BE"
+                    refreshPreview()
+                }
+                true
+            }
+            tm.show()
         }
-        addTip("Round", TipKind.ROUND)
-        addTip("Grain", TipKind.GRAIN)
-        if (spec.tipFile != null) addTip("Image", TipKind.IMAGE)
-        content.addView(tipRow)
+        val tipLp = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        )
+        tipLp.topMargin = dp(8)
+        content.addView(tipBtn, tipLp)
 
         addSlider(content, "Spacing", 0.01f, 1f, spec.spacing, { pct(it) }) {
             spec = spec.copy(spacing = it)
             refreshPreview()
         }
-        addSlider(content, "Hardness", 0f, 1f, spec.hardness, { pct(it) }) {
+        addSlider(content, "Hardness (round and grain tips)", 0f, 1f, spec.hardness, { pct(it) }) {
             spec = spec.copy(hardness = it)
             refreshPreview()
         }
@@ -582,6 +640,18 @@ class MainActivity : Activity() {
             spec = spec.copy(grain = it)
             refreshPreview()
         }
+        addSlider(content, "Dots per step (spray)", 1f, 40f, spec.count.toFloat(), { it.roundToInt().toString() }) {
+            spec = spec.copy(count = it.roundToInt().coerceIn(1, 40))
+            refreshPreview()
+        }
+        addSlider(content, "Dot size (spray)", 0.02f, 1f, spec.tipScale, { pct(it) }) {
+            spec = spec.copy(tipScale = it)
+            refreshPreview()
+        }
+        addSlider(content, "Colour variation", 0f, 1f, spec.colorJitter, { pct(it) }) {
+            spec = spec.copy(colorJitter = it)
+            refreshPreview()
+        }
         addSlider(content, "Smoothing", 0f, 1f, spec.smoothing, { pct(it) }) {
             spec = spec.copy(smoothing = it)
         }
@@ -607,21 +677,154 @@ class MainActivity : Activity() {
         }
 
         refreshPreview()
-        updateTipChips()
 
         val scroll = ScrollView(this)
         scroll.addView(content)
-        AlertDialog.Builder(this)
-            .setTitle(if (isNew) "New brush" else "Edit brush")
+        val builder = AlertDialog.Builder(this)
+            .setTitle(if (isNew) "New brush" else "Edit " + start.name)
             .setView(scroll)
             .setPositiveButton("Save") { _, _ ->
                 val nm = nameEdit.text.toString().trim()
-                val saved = spec.copy(name = if (nm.isEmpty()) "Custom brush" else nm, builtin = false)
+                val saved = spec.copy(name = if (nm.isEmpty()) "Custom brush" else nm)
                 store.save(saved)
                 selectBrush(saved)
                 toast("Brush saved")
             }
             .setNegativeButton("Cancel", null)
+        if (!isNew && start.builtin && store.isModified(start.id)) {
+            builder.setNeutralButton("Reset to default") { _, _ -> resetBrush(start) }
+        } else if (!isNew && !start.builtin) {
+            builder.setNeutralButton("Delete") { _, _ -> confirmDelete(start) }
+        }
+        builder.show()
+    }
+
+    private fun addCheck(parent: LinearLayout, label: String, value: Boolean, onChange: (Boolean) -> Unit) {
+        val cb = CheckBox(this)
+        cb.text = label
+        cb.isChecked = value
+        cb.setOnCheckedChangeListener { _, checked -> onChange(checked) }
+        parent.addView(cb)
+    }
+
+    private fun sectionTitle(parent: LinearLayout, title: String) {
+        val tv = TextView(this)
+        tv.text = title
+        tv.textSize = 15f
+        tv.setPadding(0, dp(14), 0, dp(2))
+        parent.addView(tv)
+    }
+
+    // ---- smudge settings ---------------------------------------------------------
+
+    private fun openSmudgeSettings() {
+        var st = AppSettings.smudge()
+        val content = LinearLayout(this)
+        content.orientation = LinearLayout.VERTICAL
+        content.setPadding(dp(16), dp(8), dp(16), dp(8))
+
+        val hint = TextView(this)
+        hint.text = "Strength follows the opacity slider. Size follows the size slider."
+        hint.textSize = 12f
+        content.addView(hint)
+
+        addSlider(content, "Paint carried (drag length)", 0f, 1f, st.persistence, { pct(it) }) {
+            st = st.copy(persistence = it)
+            AppSettings.setSmudge(st)
+        }
+        addSlider(content, "Edge hardness", 0f, 1f, st.hardness, { pct(it) }) {
+            st = st.copy(hardness = it)
+            AppSettings.setSmudge(st)
+        }
+        addSlider(content, "Spacing", 0.02f, 0.4f, st.spacing, { pct(it) }) {
+            st = st.copy(spacing = it)
+            AppSettings.setSmudge(st)
+        }
+        addSlider(content, "Pressure changes size", 0f, 1f, st.sizePressure, { pct(it) }) {
+            st = st.copy(sizePressure = it)
+            AppSettings.setSmudge(st)
+        }
+        addSlider(content, "Pressure changes strength", 0f, 1f, st.strengthPressure, { pct(it) }) {
+            st = st.copy(strengthPressure = it)
+            AppSettings.setSmudge(st)
+        }
+        addCheck(content, "Soften mode (blends instead of dragging)", st.soften) {
+            st = st.copy(soften = it)
+            AppSettings.setSmudge(st)
+        }
+
+        val scroll = ScrollView(this)
+        scroll.addView(content)
+        AlertDialog.Builder(this)
+            .setTitle("Smudge settings")
+            .setView(scroll)
+            .setPositiveButton("Done", null)
+            .setNeutralButton("Reset") { _, _ ->
+                AppSettings.setSmudge(SmudgeSettings())
+                toast("Smudge settings reset")
+            }
+            .show()
+    }
+
+    // ---- app settings --------------------------------------------------------------
+
+    private fun openAppSettings() {
+        val content = LinearLayout(this)
+        content.orientation = LinearLayout.VERTICAL
+        content.setPadding(dp(16), dp(8), dp(16), dp(8))
+
+        sectionTitle(content, "Drawing")
+        addCheck(content, "Stylus only (a finger pans and zooms)", AppSettings.stylusOnly) {
+            AppSettings.stylusOnly = it
+        }
+        addCheck(content, "Vibrate when a shape snaps", AppSettings.haptics) { AppSettings.haptics = it }
+
+        sectionTitle(content, "Gestures")
+        addCheck(content, "Two-finger tap = undo", AppSettings.twoFingerUndo) { AppSettings.twoFingerUndo = it }
+        addCheck(content, "Three-finger tap = redo", AppSettings.threeFingerRedo) {
+            AppSettings.threeFingerRedo = it
+        }
+        addCheck(content, "QuickShape (hold to snap shapes)", AppSettings.quickShape) {
+            AppSettings.quickShape = it
+        }
+        addSlider(
+            content, "Hold time before snapping", 250f, 1000f, AppSettings.holdDelayMs.toFloat(),
+            { it.roundToInt().toString() + " ms" }
+        ) { AppSettings.holdDelayMs = it.roundToInt() }
+        addCheck(content, "Eyedropper (touch and hold)", AppSettings.eyedropper) { AppSettings.eyedropper = it }
+        addSlider(
+            content, "Hold time for eyedropper", 300f, 1000f, AppSettings.pickDelayMs.toFloat(),
+            { it.roundToInt().toString() + " ms" }
+        ) { AppSettings.pickDelayMs = it.roundToInt() }
+
+        sectionTitle(content, "About")
+        val version = try {
+            packageManager.getPackageInfo(packageName, 0).versionName
+        } catch (e: Exception) {
+            ""
+        }
+        val about = TextView(this)
+        about.text = "Carnival  " + version
+        content.addView(about)
+
+        val scroll = ScrollView(this)
+        scroll.addView(content)
+        AlertDialog.Builder(this)
+            .setTitle("Settings")
+            .setView(scroll)
+            .setPositiveButton("Done", null)
+            .setNeutralButton("Reset all") { _, _ ->
+                AppSettings.stylusOnly = false
+                AppSettings.haptics = true
+                AppSettings.twoFingerUndo = true
+                AppSettings.threeFingerRedo = true
+                AppSettings.quickShape = true
+                AppSettings.holdDelayMs = 500
+                AppSettings.eyedropper = true
+                AppSettings.pickDelayMs = 550
+                AppSettings.setSmudge(SmudgeSettings())
+                toast("Settings reset")
+            }
             .show()
     }
 
@@ -638,6 +841,10 @@ class MainActivity : Activity() {
         val header = LinearLayout(this)
         header.orientation = LinearLayout.HORIZONTAL
         header.gravity = Gravity.CENTER_VERTICAL
+        val layersIcon = IconView(this, IconView.LAYERS)
+        val ip = LinearLayout.LayoutParams(dp(26), dp(26))
+        ip.rightMargin = dp(8)
+        header.addView(layersIcon, ip)
         val title = TextView(this)
         title.text = "Layers"
         title.setTextColor(Color.WHITE)
@@ -653,7 +860,7 @@ class MainActivity : Activity() {
 
         layerList = LinearLayout(this)
         layerList.orientation = LinearLayout.VERTICAL
-        val scroll = MaxHeightScrollView(this, dp(260))
+        val scroll = MaxHeightScrollView(this, dp(200))
         scroll.addView(layerList)
         val sp = LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
@@ -716,6 +923,112 @@ class MainActivity : Activity() {
             if (!canvas.doc.deleteActive()) toast("Can't delete the last layer")
         }, barParams())
         layerPanel.addView(row2, rp)
+
+        val row3 = LinearLayout(this)
+        row3.orientation = LinearLayout.HORIZONTAL
+        row3.addView(Ui.chip(this, "Edit") { openLayerSettings(canvas.doc.active) }, barParams())
+        row3.addView(Ui.chip(this, "Merge down") { mergeDown() }, barParams())
+        row3.addView(Ui.chip(this, "Clear") { canvas.doc.clearActive() }, barParams())
+        layerPanel.addView(row3, rp)
+    }
+
+    private fun mergeDown() {
+        val d = canvas.doc
+        if (d.layers.indexOf(d.active) <= 0) {
+            toast("There is no layer below to merge into")
+        } else if (!d.mergeDown()) {
+            toast("Show the layer first, then merge it")
+        }
+    }
+
+    private fun showLayerMenu(layer: Layer, anchor: View) {
+        canvas.doc.active = layer
+        val pm = PopupMenu(this, anchor)
+        pm.menu.add("Layer settings")
+        pm.menu.add("Rename")
+        pm.menu.add("Duplicate")
+        pm.menu.add("Merge down")
+        pm.menu.add("Clear")
+        pm.menu.add("Delete")
+        pm.setOnMenuItemClickListener { item ->
+            when (item.title.toString()) {
+                "Layer settings" -> openLayerSettings(layer)
+                "Rename" -> renameLayer(layer)
+                "Duplicate" ->
+                    if (!canvas.doc.duplicateActive()) toast("Layer limit reached (${Document.MAX_LAYERS})")
+                "Merge down" -> mergeDown()
+                "Clear" -> canvas.doc.clearActive()
+                "Delete" ->
+                    if (!canvas.doc.deleteActive()) toast("Can't delete the last layer")
+            }
+            true
+        }
+        pm.setOnDismissListener { refreshLayerPanel() }
+        pm.show()
+    }
+
+    private fun renameLayer(layer: Layer) {
+        val edit = EditText(this)
+        edit.setText(layer.name)
+        edit.setSingleLine(true)
+        edit.setSelectAllOnFocus(true)
+        AlertDialog.Builder(this)
+            .setTitle("Rename layer")
+            .setView(edit)
+            .setPositiveButton("OK") { _, _ ->
+                val nm = edit.text.toString().trim()
+                if (nm.isNotEmpty()) canvas.doc.setProps(layer, layer.props().copy(name = nm))
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun openLayerSettings(layer: Layer) {
+        var p = layer.props()
+        val content = LinearLayout(this)
+        content.orientation = LinearLayout.VERTICAL
+        content.setPadding(dp(16), dp(8), dp(16), dp(8))
+
+        val nameEdit = EditText(this)
+        nameEdit.setText(p.name)
+        nameEdit.setSingleLine(true)
+        nameEdit.hint = "Layer name"
+        content.addView(nameEdit)
+
+        addSlider(content, "Opacity", 0f, 1f, p.opacity, { pct(it) }) { p = p.copy(opacity = it) }
+
+        val blendChip = Ui.chip(this, "Blend: " + p.blend.label + "  \u25BE") {}
+        blendChip.setOnClickListener {
+            val bm = PopupMenu(this, blendChip)
+            for (b in Blend.values()) bm.menu.add(b.label)
+            bm.setOnMenuItemClickListener { item ->
+                val chosen = Blend.values().firstOrNull { it.label == item.title.toString() }
+                if (chosen != null) {
+                    p = p.copy(blend = chosen)
+                    blendChip.text = "Blend: " + chosen.label + "  \u25BE"
+                }
+                true
+            }
+            bm.show()
+        }
+        val bl = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        )
+        bl.topMargin = dp(10)
+        content.addView(blendChip, bl)
+
+        addCheck(content, "Visible", p.visible) { p = p.copy(visible = it) }
+        addCheck(content, "Locked (can't be drawn on)", p.locked) { p = p.copy(locked = it) }
+
+        AlertDialog.Builder(this)
+            .setTitle("Layer settings")
+            .setView(content)
+            .setPositiveButton("Apply") { _, _ ->
+                val nm = nameEdit.text.toString().trim()
+                canvas.doc.setProps(layer, p.copy(name = if (nm.isEmpty()) p.name else nm))
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
     }
 
     private fun showBlendMenu() {
@@ -757,9 +1070,13 @@ class MainActivity : Activity() {
         name.textSize = 14f
         name.alpha = if (layer.visible) 1f else 0.5f
 
+        val dots = IconView(this, IconView.DOTS)
+        dots.setOnClickListener { showLayerMenu(layer, dots) }
+
         row.addView(eye)
         row.addView(thumb, tp)
         row.addView(name, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        row.addView(dots, LinearLayout.LayoutParams(dp(34), dp(40)))
         row.setOnClickListener { doc.select(layer) }
 
         val lp = LinearLayout.LayoutParams(

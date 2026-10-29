@@ -20,7 +20,7 @@ class Tip(private val variants: List<List<Bitmap>>) {
 object TipCache {
     private val cache = object : LinkedHashMap<String, Tip>(16, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Tip>?): Boolean =
-            size > 24
+            size > 40
     }
 
     fun get(context: Context, spec: BrushSpec): Tip {
@@ -38,27 +38,24 @@ object TipCache {
         TipKind.ROUND -> "r|" + q(spec.hardness)
         TipKind.GRAIN -> "g|" + q(spec.hardness) + "|" + q(spec.grain)
         TipKind.IMAGE -> "i|" + spec.tipFile + "|" + spec.invertTip
+        else -> "k|" + spec.tip.name
     }
 
     private fun build(context: Context, spec: BrushSpec): Tip {
         val h = q(spec.hardness) / 50f
-        return when (spec.tip) {
-            TipKind.ROUND -> Tip(listOf(toBitmaps(TipMath.round(TipMath.BASE, h))))
-            TipKind.GRAIN -> {
-                val g = q(spec.grain) / 50f
-                Tip(listOf(11L, 23L, 37L).map { toBitmaps(TipMath.grain(TipMath.BASE, h, g, it)) })
-            }
-            TipKind.IMAGE -> {
-                val file = spec.tipFile
-                val mask = if (file != null) BrushStore.loadTipMask(context, file) else null
-                if (mask == null) {
-                    Tip(listOf(toBitmaps(TipMath.round(TipMath.BASE, 0.9f))))
-                } else {
-                    val m = if (spec.invertTip) TipMath.invert(mask) else mask
-                    Tip(listOf(toBitmaps(m)))
-                }
-            }
+        val g = q(spec.grain) / 50f
+        if (spec.tip == TipKind.IMAGE) {
+            val file = spec.tipFile
+            val mask = if (file != null) BrushStore.loadTipMask(context, file) else null
+            if (mask == null) return Tip(listOf(toBitmaps(TipMath.round(TipMath.BASE, 0.9f))))
+            val m = if (spec.invertTip) TipMath.invert(mask) else mask
+            return Tip(listOf(toBitmaps(m)))
         }
+        val list = ArrayList<List<Bitmap>>()
+        for (v in 0 until spec.variants) {
+            list.add(toBitmaps(TipMath.forKind(spec.tip, TipMath.BASE, h, g, v)))
+        }
+        return Tip(list)
     }
 
     private fun toBitmaps(base: ByteArray): List<Bitmap> {

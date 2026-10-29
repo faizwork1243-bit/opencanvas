@@ -37,10 +37,10 @@ class BrushPainter(
         return if (r.intersect(0, 0, Document.SIZE, Document.SIZE)) r else null
     }
 
-    override fun stamp(x: Float, y: Float, diameter: Float, flow: Float, angleDeg: Float, variant: Int) {
+    override fun stamp(x: Float, y: Float, diameter: Float, flow: Float, angleDeg: Float, variant: Int, shade: Float) {
         val bmp = tip.pick(variant, diameter)
         val a = (flow * 255f + 0.5f).toInt().coerceIn(1, 255)
-        paint.color = (color and 0x00FFFFFF) or (a shl 24)
+        paint.color = (ColorMath.shade(color, shade) and 0x00FFFFFF) or (a shl 24)
         canvas.save()
         canvas.translate(x, y)
         if (angleDeg != 0f) canvas.rotate(angleDeg)
