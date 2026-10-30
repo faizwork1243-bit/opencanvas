@@ -27,9 +27,18 @@ data class LayerProps(
     val blend: Blend
 )
 
-class Layer(var name: String) {
-    val bitmap: Bitmap = Bitmap.createBitmap(Document.SIZE, Document.SIZE, Bitmap.Config.ARGB_8888)
+class Layer(
+    var name: String,
+    val width: Int,
+    val height: Int,
+    /** Stable id, used for the layer's file when the project is saved. */
+    val id: String = java.util.UUID.randomUUID().toString().substring(0, 8)
+) {
+    val bitmap: Bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
     val canvas = Canvas(bitmap)
+
+    /** True when the pixels have changed since the layer was last saved. */
+    @Volatile var dirty = true
 
     var opacity = 1f
     var visible = true
@@ -50,11 +59,12 @@ class Layer(var name: String) {
 
     fun clear() {
         bitmap.eraseColor(Color.TRANSPARENT)
+        dirty = true
     }
 
     /** A full copy of the pixels, used to undo "clear layer". */
     fun snapshot(): Bitmap {
-        val copy = Bitmap.createBitmap(Document.SIZE, Document.SIZE, Bitmap.Config.ARGB_8888)
+        val copy = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
         Canvas(copy).drawBitmap(bitmap, 0f, 0f, patchPaint)
         return copy
     }
@@ -62,10 +72,11 @@ class Layer(var name: String) {
     /** Replaces a rectangle of the layer with the given pixels (used by undo and redo). */
     fun putPatch(x: Int, y: Int, patch: Bitmap) {
         canvas.drawBitmap(patch, x.toFloat(), y.toFloat(), patchPaint)
+        dirty = true
     }
 
     fun duplicate(newName: String): Layer {
-        val c = Layer(newName)
+        val c = Layer(newName, width, height)
         c.canvas.drawBitmap(bitmap, 0f, 0f, patchPaint)
         c.restore(props().copy(name = newName))
         return c

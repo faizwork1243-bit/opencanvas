@@ -181,7 +181,7 @@ class ColorPickerView(context: Context) : View(context) {
 class LayerThumb(context: Context, private val layer: Layer) : View(context) {
     private val paper = Paint().apply { color = Color.WHITE }
     private val bmp = Paint(Paint.FILTER_BITMAP_FLAG)
-    private val src = Rect(0, 0, Document.SIZE, Document.SIZE)
+    private val src = Rect(0, 0, layer.width, layer.height)
     private val dst = RectF()
 
     override fun onDraw(canvas: Canvas) {

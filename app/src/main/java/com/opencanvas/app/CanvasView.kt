@@ -44,7 +44,9 @@ class CanvasView @JvmOverloads constructor(
     attrs: AttributeSet? = null
 ) : View(context, attrs) {
 
-    val doc = Document()
+    /** The drawing being edited. Set once with setDocument() before the view is used. */
+    var doc: Document = Document(1, 1)
+        private set
 
     var tool: Tool = Tool.BRUSH
     var brush: BrushSpec = Brushes.PENCIL
@@ -64,7 +66,7 @@ class CanvasView @JvmOverloads constructor(
     private val holdSlop = 6f * density
 
     /** The live stroke, drawn into small tiles so only a few KB change per frame. */
-    private val overlay = TileSet(Document.SIZE, Document.SIZE)
+    private var overlay = TileSet(1, 1)
 
     // the stroke in progress
     private var drawing = false
@@ -84,7 +86,7 @@ class CanvasView @JvmOverloads constructor(
     private val inverse = Matrix()
     private val tmp = FloatArray(2)
     private val vals = FloatArray(9)
-    private val docRect = RectF(0f, 0f, Document.SIZE.toFloat(), Document.SIZE.toFloat())
+    private val docRect = RectF(0f, 0f, 1f, 1f)
 
     private val dstOut = PorterDuffXfermode(PorterDuff.Mode.DST_OUT)
     private val paperPaint = Paint().apply { color = Color.WHITE }
@@ -145,29 +147,44 @@ class CanvasView @JvmOverloads constructor(
     )
 
     init {
-        doc.onChanged = {
+        hookDoc(doc)
+    }
+
+    private fun hookDoc(d: Document) {
+        d.onChanged = {
             invalidate()
             onDocChanged?.invoke()
         }
+    }
+
+    /** Switches to another drawing (and its canvas size). */
+    fun setDocument(d: Document) {
+        cancelStroke()
+        doc = d
+        hookDoc(d)
+        overlay = TileSet(d.width, d.height)
+        docRect.set(0f, 0f, d.width.toFloat(), d.height.toFloat())
+        fitToView()
+        onDocChanged?.invoke()
     }
 
     // ---- public actions ----------------------------------------------------
 
     fun fitToView() {
         if (width == 0 || height == 0) return
-        val scale = min(width / Document.SIZE.toFloat(), height / Document.SIZE.toFloat()) * 0.95f
+        val scale = min(width / doc.width.toFloat(), height / doc.height.toFloat()) * 0.95f
         matrix.reset()
         matrix.postScale(scale, scale)
         matrix.postTranslate(
-            (width - Document.SIZE * scale) / 2f,
-            (height - Document.SIZE * scale) / 2f
+            (width - doc.width * scale) / 2f,
+            (height - doc.height * scale) / 2f
         )
         invalidate()
     }
 
     /** Flattens the visible layers onto white paper. */
     fun exportBitmap(): Bitmap {
-        val out = Bitmap.createBitmap(Document.SIZE, Document.SIZE, Bitmap.Config.ARGB_8888)
+        val out = Bitmap.createBitmap(doc.width, doc.height, Bitmap.Config.ARGB_8888)
         drawDocument(Canvas(out), false)
         return out
     }
@@ -443,8 +460,8 @@ class CanvasView @JvmOverloads constructor(
         pickX = x
         pickY = y
         val d = toDoc(x, y)
-        val ix = d[0].toInt().coerceIn(0, Document.SIZE - 1)
-        val iy = d[1].toInt().coerceIn(0, Document.SIZE - 1)
+        val ix = d[0].toInt().coerceIn(0, doc.width - 1)
+        val iy = d[1].toInt().coerceIn(0, doc.height - 1)
         pickColor = sampleColor(ix, iy)
         invalidate()
     }
@@ -514,7 +531,7 @@ class CanvasView @JvmOverloads constructor(
             liveErase = tool == Tool.ERASE
             liveOpacity = brushOpacity
             strokeColor = if (liveErase) Color.BLACK else brushColor
-            val pa = BrushPainter(TileTarget(overlay), spec, strokeTip!!, strokeSize, strokeColor, strokeSeed)
+            val pa = BrushPainter(TileTarget(overlay), spec, strokeTip!!, strokeSize, strokeColor, strokeSeed, doc.width, doc.height)
             painter = pa
             pa.begin(d[0], d[1], p)
         }
@@ -554,7 +571,7 @@ class CanvasView @JvmOverloads constructor(
         val spec = strokeSpec ?: return
         val tip = strokeTip ?: return
         overlay.clear()
-        val pa = BrushPainter(TileTarget(overlay), spec, tip, strokeSize, strokeColor, strokeSeed)
+        val pa = BrushPainter(TileTarget(overlay), spec, tip, strokeSize, strokeColor, strokeSeed, doc.width, doc.height)
         pa.begin(xs[0], ys[0], p)
         for (i in 1 until xs.size) pa.moveTo(xs[i], ys[i], p)
         painter = pa
@@ -648,6 +665,7 @@ class CanvasView @JvmOverloads constructor(
         }
         val after = Bitmap.createBitmap(layer.bitmap, r.left, r.top, r.width(), r.height())
         overlay.clear()
+        layer.dirty = true
         doc.push(PatchCmd(layer, r.left, r.top, before, after))
         doc.changed()
     }

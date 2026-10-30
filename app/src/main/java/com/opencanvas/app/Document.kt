@@ -99,6 +99,7 @@ class MergeDownCmd(
         paint.alpha = (upper.opacity * 255f).roundToInt().coerceIn(0, 255)
         paint.xfermode = upper.blend.xfermode
         lower.canvas.drawBitmap(upper.bitmap, 0f, 0f, paint)
+        lower.dirty = true
         doc.layers.remove(upper)
         doc.active = lower
     }
@@ -126,9 +127,12 @@ class PropsCmd(
     override fun undo(doc: Document) = layer.restore(before)
 }
 
-class Document {
+class Document(val width: Int, val height: Int, createFirstLayer: Boolean = true) {
     val layers = ArrayList<Layer>()
-    var active: Layer = Layer("Layer 1")
+    lateinit var active: Layer
+
+    /** How many layers this canvas size allows. */
+    val maxLayers: Int = CanvasSizes.maxLayers(width, height)
     var onChanged: (() -> Unit)? = null
 
     private var counter = 1
@@ -137,8 +141,26 @@ class Document {
     private var undoBytes = 0L
 
     init {
-        layers.add(active)
+        if (createFirstLayer) {
+            active = Layer("Layer 1", width, height)
+            layers.add(active)
+        }
     }
+
+    /** Used when opening a saved project: swaps in the loaded layers and clears the history. */
+    fun setLayers(list: List<Layer>, activeIndex: Int, layerCounter: Int) {
+        layers.clear()
+        layers.addAll(list)
+        active = layers[activeIndex.coerceIn(0, layers.size - 1)]
+        counter = layerCounter
+        for (c in undoStack) c.release()
+        for (c in redoStack) c.release()
+        undoStack.clear()
+        redoStack.clear()
+        undoBytes = 0L
+    }
+
+    val layerCounter: Int get() = counter
 
     fun changed() {
         onChanged?.invoke()
@@ -198,14 +220,14 @@ class Document {
     }
 
     fun addLayer(): Boolean {
-        if (layers.size >= MAX_LAYERS) return false
+        if (layers.size >= maxLayers) return false
         counter++
-        run(AddLayerCmd(layers.indexOf(active) + 1, Layer("Layer $counter")))
+        run(AddLayerCmd(layers.indexOf(active) + 1, Layer("Layer $counter", width, height)))
         return true
     }
 
     fun duplicateActive(): Boolean {
-        if (layers.size >= MAX_LAYERS) return false
+        if (layers.size >= maxLayers) return false
         val src = active
         run(AddLayerCmd(layers.indexOf(src) + 1, src.duplicate(src.name + " copy")))
         return true
@@ -257,8 +279,6 @@ class Document {
     }
 
     companion object {
-        const val SIZE = 2048
-        const val MAX_LAYERS = 8
         const val MAX_HISTORY = 300
         const val MAX_HISTORY_BYTES = 200L * 1024L * 1024L
     }

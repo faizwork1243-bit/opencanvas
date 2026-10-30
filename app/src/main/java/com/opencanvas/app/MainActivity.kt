@@ -30,6 +30,14 @@ class MainActivity : Activity() {
 
     private lateinit var canvas: CanvasView
     private lateinit var store: BrushStore
+    private lateinit var projects: ProjectStore
+    private lateinit var meta: ProjectMeta
+    private lateinit var rootView: FrameLayout
+
+    /** Counts changes to the drawing so we only save when something is new. */
+    @Volatile private var edits = 0
+    @Volatile private var savedEdits = 0
+    private var exiting = false
 
     private lateinit var layerPanel: LinearLayout
     private lateinit var layerList: LinearLayout
@@ -67,7 +75,18 @@ class MainActivity : Activity() {
 
         AppSettings.init(this)
         store = BrushStore(this)
+        projects = ProjectStore(this)
+        val pid = intent.getStringExtra(EXTRA_PROJECT)
+        val m = if (pid != null) projects.readMeta(pid) else null
+        if (m == null) {
+            startActivity(Intent(this, GalleryActivity::class.java))
+            finish()
+            return
+        }
+        meta = m
         canvas = CanvasView(this)
+        val openDoc = projects.prepare(meta)
+        canvas.setDocument(openDoc)
         val prefs = getSharedPreferences("carnival", MODE_PRIVATE)
         canvas.brush = store.find(prefs.getString("brush", "pencil") ?: "pencil") ?: Brushes.PENCIL
         canvas.onBlocked = { msg -> toast(msg) }
@@ -87,6 +106,7 @@ class MainActivity : Activity() {
         )
 
         val root = FrameLayout(this)
+        rootView = root
         root.addView(
             canvas,
             FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
@@ -102,6 +122,7 @@ class MainActivity : Activity() {
         setContentView(root)
 
         canvas.onDocChanged = {
+            edits++
             if (layerPanel.visibility == View.VISIBLE) {
                 refreshLayerPanel()
             } else {
@@ -111,6 +132,84 @@ class MainActivity : Activity() {
         refreshLayerPanel()
         refreshRecent()
         updateToolButtons()
+        loadPixels(openDoc)
+    }
+
+    /** Reads the saved layer images in the background while a "Loading" cover blocks the canvas. */
+    private fun loadPixels(d: Document) {
+        val cover = FrameLayout(this)
+        cover.setBackgroundColor(0xFF1E1E1E.toInt())
+        cover.isClickable = true
+        val tv = TextView(this)
+        tv.text = "Opening ${meta.name}..."
+        tv.setTextColor(Color.WHITE)
+        tv.textSize = 16f
+        tv.gravity = Gravity.CENTER
+        cover.addView(tv, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        rootView.addView(cover)
+        val metaCopy = meta
+        Thread {
+            projects.loadPixels(metaCopy, d)
+            runOnUiThread {
+                rootView.removeView(cover)
+                canvas.invalidate()
+                refreshLayerPanel()
+                edits = 0
+                savedEdits = 0
+            }
+        }.start()
+    }
+
+    /** Saves in the background if anything changed. Used when the app goes out of view. */
+    private fun saveInBackground() {
+        if (!::meta.isInitialized || edits == savedEdits) return
+        val mark = edits
+        val snap = SaveSnapshot.of(canvas.doc)
+        val mt = meta
+        Thread {
+            try {
+                projects.save(mt, snap)
+                savedEdits = mark
+            } catch (e: Throwable) {
+                // The next save will try again.
+            }
+        }.start()
+    }
+
+    /** Saves, then goes back to the gallery. */
+    private fun saveAndExit() {
+        if (exiting) return
+        exiting = true
+        if (edits == savedEdits) {
+            finish()
+            return
+        }
+        toast("Saving...")
+        val mark = edits
+        val snap = SaveSnapshot.of(canvas.doc)
+        val mt = meta
+        Thread {
+            var ok = true
+            try {
+                projects.save(mt, snap)
+                savedEdits = mark
+            } catch (e: Throwable) {
+                ok = false
+            }
+            runOnUiThread {
+                if (ok) {
+                    finish()
+                } else {
+                    exiting = false
+                    toast("Save failed - not closing")
+                }
+            }
+        }.start()
+    }
+
+    override fun onStop() {
+        saveInBackground()
+        super.onStop()
     }
 
     override fun onBackPressed() {
@@ -118,7 +217,7 @@ class MainActivity : Activity() {
             hidePanels()
             updateToolButtons()
         } else {
-            super.onBackPressed()
+            saveAndExit()
         }
     }
 
@@ -221,14 +320,16 @@ class MainActivity : Activity() {
 
     private fun showActionsMenu(anchor: View) {
         val pm = PopupMenu(this, anchor)
-        pm.menu.add("Save PNG")
+        pm.menu.add("Gallery")
+        pm.menu.add("Export...")
         pm.menu.add("Clear layer")
         pm.menu.add("Fit to screen")
         pm.menu.add("Settings")
         pm.menu.add("Gesture guide")
         pm.setOnMenuItemClickListener { item ->
             when (item.title.toString()) {
-                "Save PNG" -> savePng()
+                "Gallery" -> saveAndExit()
+                "Export..." -> showExport()
                 "Clear layer" -> canvas.doc.clearActive()
                 "Fit to screen" -> canvas.fitToView()
                 "Settings" -> openAppSettings()
@@ -255,15 +356,30 @@ class MainActivity : Activity() {
             .show()
     }
 
-    private fun savePng() {
-        val bmp = canvas.exportBitmap()
-        val name = "Carnival_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+    private fun showExport() {
+        val formats = ExportFormat.values()
+        val items = formats.map { it.label + "\n" + it.detail }.toTypedArray()
+        AlertDialog.Builder(this)
+            .setTitle("Export \"${meta.name}\"")
+            .setItems(items) { _, which -> startExport(formats[which]) }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun startExport(fmt: ExportFormat) {
+        val d = canvas.doc
+        val safe = meta.name.replace(Regex("[^A-Za-z0-9 _-]"), "").trim().ifEmpty { "Carnival" }.replace(' ', '_')
+        val name = safe + "_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        val flat = canvas.exportBitmap()
+        val layers = ArrayList(d.layers)
+        val job = ExportJob(name, fmt, d.width, d.height, meta.dpi, flat, layers, layers.map { it.props() })
         val appCtx = applicationContext
+        toast("Exporting ${fmt.label}...")
         Thread {
-            val where = Exporter.savePng(appCtx, bmp, name)
+            val where = Exporter.run(appCtx, job)
             runOnUiThread {
-                toast(if (where != null) "Saved: $where" else "Save failed")
-                bmp.recycle()
+                toast(if (where != null) "Saved: $where" else "Export failed")
+                flat.recycle()
             }
         }.start()
     }
@@ -859,10 +975,10 @@ class MainActivity : Activity() {
         title.textSize = 16f
         header.addView(title, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         header.addView(Ui.chip(this, "+ New") {
-            if (!canvas.doc.addLayer()) toast("Layer limit reached (${Document.MAX_LAYERS})")
+            if (!canvas.doc.addLayer()) toast("Layer limit reached (${canvas.doc.maxLayers})")
         }, barParams())
         header.addView(Ui.chip(this, "Copy") {
-            if (!canvas.doc.duplicateActive()) toast("Layer limit reached (${Document.MAX_LAYERS})")
+            if (!canvas.doc.duplicateActive()) toast("Layer limit reached (${canvas.doc.maxLayers})")
         }, barParams())
         layerPanel.addView(header)
 
@@ -963,7 +1079,7 @@ class MainActivity : Activity() {
                 "Layer settings" -> openLayerSettings(layer)
                 "Rename" -> renameLayer(layer)
                 "Duplicate" ->
-                    if (!canvas.doc.duplicateActive()) toast("Layer limit reached (${Document.MAX_LAYERS})")
+                    if (!canvas.doc.duplicateActive()) toast("Layer limit reached (${canvas.doc.maxLayers})")
                 "Merge down" -> mergeDown()
                 "Clear" -> canvas.doc.clearActive()
                 "Delete" ->
@@ -1165,5 +1281,6 @@ class MainActivity : Activity() {
 
     companion object {
         private const val REQ_TIP = 41
+        const val EXTRA_PROJECT = "project_id"
     }
 }

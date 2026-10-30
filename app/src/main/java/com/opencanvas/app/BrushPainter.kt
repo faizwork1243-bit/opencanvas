@@ -45,7 +45,9 @@ class BrushPainter(
     private val tip: Tip,
     size: Float,
     private val color: Int,
-    seed: Long
+    seed: Long,
+    private val canvasW: Int,
+    private val canvasH: Int
 ) : StampSink, StampDrawer {
 
     private val placer = StampPlacer(spec, size, this, seed)
@@ -68,7 +70,7 @@ class BrushPainter(
         if (!hasBox) return null
         val r = Rect()
         box.roundOut(r)
-        return if (r.intersect(0, 0, Document.SIZE, Document.SIZE)) r else null
+        return if (r.intersect(0, 0, canvasW, canvasH)) r else null
     }
 
     override fun stamp(x: Float, y: Float, diameter: Float, flow: Float, angleDeg: Float, variant: Int, shade: Float) {
@@ -105,7 +107,7 @@ class BrushPainter(
 object BrushPreview {
     fun render(context: Context, spec: BrushSpec, w: Int, h: Int, color: Int): Bitmap {
         val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-        val painter = BrushPainter(CanvasTarget(Canvas(bmp)), spec, TipCache.get(context, spec), h * 0.42f, color, 7L)
+        val painter = BrushPainter(CanvasTarget(Canvas(bmp)), spec, TipCache.get(context, spec), h * 0.42f, color, 7L, w, h)
         val n = 60
         val twoPi = (2.0 * PI).toFloat()
         for (i in 0..n) {
