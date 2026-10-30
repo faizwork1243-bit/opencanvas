@@ -52,6 +52,7 @@ class MainActivity : Activity() {
     private val recent = ArrayList<Int>()
     private val previewCache = HashMap<BrushSpec, Bitmap>()
     private var brushListDirty = true
+    private var layersDirty = true
     private var dragLayer: Layer? = null
     private var dragBefore: LayerProps? = null
 
@@ -100,7 +101,13 @@ class MainActivity : Activity() {
         root.addView(brushPanel)
         setContentView(root)
 
-        canvas.onDocChanged = { refreshLayerPanel() }
+        canvas.onDocChanged = {
+            if (layerPanel.visibility == View.VISIBLE) {
+                refreshLayerPanel()
+            } else {
+                layersDirty = true
+            }
+        }
         refreshLayerPanel()
         refreshRecent()
         updateToolButtons()
@@ -133,6 +140,7 @@ class MainActivity : Activity() {
         hidePanels()
         if (show) {
             if (panel === brushPanel && brushListDirty) refreshBrushList()
+            if (panel === layerPanel && layersDirty) refreshLayerPanel()
             panel.visibility = View.VISIBLE
         }
         updateToolButtons()
@@ -1094,6 +1102,7 @@ class MainActivity : Activity() {
         for (i in doc.layers.indices.reversed()) {
             layerList.addView(makeRow(doc.layers[i]))
         }
+        layersDirty = false
         val a = doc.active
         val pctValue = Math.round(a.opacity * 100f)
         opacitySeek.progress = pctValue

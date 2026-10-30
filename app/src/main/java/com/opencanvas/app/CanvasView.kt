@@ -35,8 +35,8 @@ enum class Tool { BRUSH, SMUDGE, ERASE }
  * - draw, then hold still before lifting = QuickShape (line, arc, circle, ellipse, rectangle, polygon)
  * - touch and hold without moving = eyedropper
  *
- * Brush and eraser strokes are stamped into a scratch bitmap and composited at the brush
- * opacity when the stroke ends. Smudge works directly on the layer. Undo stores the pixels of
+ * Brush and eraser strokes are stamped into small live tiles and composited at the brush
+ * opacity when the stroke ends. Smudge also works in live tiles. Undo stores the pixels of
  * the touched rectangle before and after, so it works for every kind of stroke.
  */
 class CanvasView @JvmOverloads constructor(
@@ -63,9 +63,8 @@ class CanvasView @JvmOverloads constructor(
     private val slop = ViewConfiguration.get(context).scaledTouchSlop.toFloat()
     private val holdSlop = 6f * density
 
-    private val scratch = Bitmap.createBitmap(Document.SIZE, Document.SIZE, Bitmap.Config.ARGB_8888)
-    private val scratchCanvas = Canvas(scratch)
-    private var backup: Bitmap? = null
+    /** The live stroke, drawn into small tiles so only a few KB change per frame. */
+    private val overlay = TileSet(Document.SIZE, Document.SIZE)
 
     // the stroke in progress
     private var drawing = false
@@ -92,6 +91,9 @@ class CanvasView @JvmOverloads constructor(
     private val layerPaint = Paint(Paint.FILTER_BITMAP_FLAG)
     private val bitmapPaint = Paint(Paint.FILTER_BITMAP_FLAG)
     private val livePaint = Paint(Paint.FILTER_BITMAP_FLAG)
+    private val smudgePaint = Paint(Paint.FILTER_BITMAP_FLAG).apply {
+        xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC)
+    }
     private val commitPaint = Paint()
     private val copyPaint = Paint().apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC) }
     private val ringPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
@@ -189,25 +191,31 @@ class CanvasView @JvmOverloads constructor(
     }
 
     private fun drawDocument(canvas: Canvas, withLive: Boolean) {
-        val group = canvas.saveLayer(docRect, null)
+        val saved = canvas.save()
+        canvas.clipRect(docRect)
         canvas.drawRect(docRect, paperPaint)
+        val smudging = smudger != null
         for (layer in doc.layers) {
             if (!layer.visible) continue
             layerPaint.alpha = (layer.opacity * 255f).roundToInt().coerceIn(0, 255)
             layerPaint.xfermode = layer.blend.xfermode
-            val live = withLive && drawing && painter != null && layer === liveLayer
+            val live = withLive && drawing && layer === liveLayer && !overlay.isEmpty
             if (live) {
                 val lg = canvas.saveLayer(docRect, layerPaint)
                 canvas.drawBitmap(layer.bitmap, 0f, 0f, bitmapPaint)
-                livePaint.alpha = (liveOpacity * 255f).roundToInt().coerceIn(0, 255)
-                livePaint.xfermode = if (liveErase) dstOut else null
-                canvas.drawBitmap(scratch, 0f, 0f, livePaint)
+                if (smudging) {
+                    overlay.draw(canvas, smudgePaint)
+                } else {
+                    livePaint.alpha = (liveOpacity * 255f).roundToInt().coerceIn(0, 255)
+                    livePaint.xfermode = if (liveErase) dstOut else null
+                    overlay.draw(canvas, livePaint)
+                }
                 canvas.restoreToCount(lg)
             } else {
                 canvas.drawBitmap(layer.bitmap, 0f, 0f, layerPaint)
             }
         }
-        canvas.restoreToCount(group)
+        canvas.restoreToCount(saved)
     }
 
     override fun onDraw(canvas: Canvas) {
@@ -493,12 +501,8 @@ class CanvasView @JvmOverloads constructor(
         strokeSize = brushSize
 
         if (tool == Tool.SMUDGE) {
-            val bk = backup ?: Bitmap.createBitmap(
-                Document.SIZE, Document.SIZE, Bitmap.Config.ARGB_8888
-            ).also { backup = it }
-            Canvas(bk).drawBitmap(layer.bitmap, 0f, 0f, copyPaint)
             val sp = SmudgePainter(
-                layer.bitmap, bk, AppSettings.smudge(),
+                layer.bitmap, overlay, AppSettings.smudge(),
                 strokeSize, max(brushOpacity, 0.05f), strokeSeed
             )
             smudger = sp
@@ -510,7 +514,7 @@ class CanvasView @JvmOverloads constructor(
             liveErase = tool == Tool.ERASE
             liveOpacity = brushOpacity
             strokeColor = if (liveErase) Color.BLACK else brushColor
-            val pa = BrushPainter(scratchCanvas, spec, strokeTip!!, strokeSize, strokeColor, strokeSeed)
+            val pa = BrushPainter(TileTarget(overlay), spec, strokeTip!!, strokeSize, strokeColor, strokeSeed)
             painter = pa
             pa.begin(d[0], d[1], p)
         }
@@ -545,20 +549,12 @@ class CanvasView @JvmOverloads constructor(
         smudger?.moveTo(x, y, p)
     }
 
-    private fun clearScratch(r: Rect) {
-        scratchCanvas.save()
-        scratchCanvas.clipRect(r)
-        scratchCanvas.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
-        scratchCanvas.restore()
-    }
-
     /** Re-stamps the whole stroke along a new path (used by QuickShape). */
     private fun replay(xs: FloatArray, ys: FloatArray, p: Float) {
         val spec = strokeSpec ?: return
         val tip = strokeTip ?: return
-        val old = painter?.dirtyRect()
-        if (old != null) clearScratch(old)
-        val pa = BrushPainter(scratchCanvas, spec, tip, strokeSize, strokeColor, strokeSeed)
+        overlay.clear()
+        val pa = BrushPainter(TileTarget(overlay), spec, tip, strokeSize, strokeColor, strokeSeed)
         pa.begin(xs[0], ys[0], p)
         for (i in 1 until xs.size) pa.moveTo(xs[i], ys[i], p)
         painter = pa
@@ -624,56 +620,43 @@ class CanvasView @JvmOverloads constructor(
         liveLayer = null
         straight = false
         shapeFollows = false
+        painter = null
+        smudger = null
 
         if (r == null) {
-            painter = null
-            smudger = null
+            overlay.clear()
             invalidate()
             return
         }
 
+        // merge the live tiles into the layer, remembering the pixels before and after for undo
+        val before = Bitmap.createBitmap(layer.bitmap, r.left, r.top, r.width(), r.height())
         if (sm != null) {
-            val bk = backup
-            if (bk != null) {
-                val before = Bitmap.createBitmap(bk, r.left, r.top, r.width(), r.height())
-                val after = Bitmap.createBitmap(layer.bitmap, r.left, r.top, r.width(), r.height())
-                doc.push(PatchCmd(layer, r.left, r.top, before, after))
+            overlay.forEachTouched { tx, ty, bmp ->
+                layer.canvas.drawBitmap(
+                    bmp, (tx * TileGeom.T).toFloat(), (ty * TileGeom.T).toFloat(), copyPaint
+                )
             }
         } else {
-            val before = Bitmap.createBitmap(layer.bitmap, r.left, r.top, r.width(), r.height())
             commitPaint.alpha = (opacity * 255f).roundToInt().coerceIn(0, 255)
             commitPaint.xfermode = if (erase) dstOut else null
-            layer.canvas.drawBitmap(scratch, r, r, commitPaint)
-            val after = Bitmap.createBitmap(layer.bitmap, r.left, r.top, r.width(), r.height())
-            clearScratch(r)
-            doc.push(PatchCmd(layer, r.left, r.top, before, after))
+            overlay.forEachTouched { tx, ty, bmp ->
+                layer.canvas.drawBitmap(
+                    bmp, (tx * TileGeom.T).toFloat(), (ty * TileGeom.T).toFloat(), commitPaint
+                )
+            }
         }
-        painter = null
-        smudger = null
+        val after = Bitmap.createBitmap(layer.bitmap, r.left, r.top, r.width(), r.height())
+        overlay.clear()
+        doc.push(PatchCmd(layer, r.left, r.top, before, after))
         doc.changed()
     }
 
     private fun cancelStroke() {
         if (!drawing) return
-        val pa = painter
-        if (pa != null) {
-            val r = pa.dirtyRect()
-            if (r != null) clearScratch(r)
-        }
-        val sm = smudger
-        val layer = liveLayer
-        if (sm != null && layer != null) {
-            val r = sm.dirtyRect()
-            val bk = backup
-            if (r != null && bk != null) {
-                layer.canvas.save()
-                layer.canvas.clipRect(r)
-                layer.canvas.drawBitmap(bk, 0f, 0f, copyPaint)
-                layer.canvas.restore()
-            }
-        }
         painter = null
         smudger = null
+        overlay.clear()
         drawing = false
         liveLayer = null
         straight = false
